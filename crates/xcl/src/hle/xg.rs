@@ -473,7 +473,7 @@ struct Computer {
 fn vtbl() -> &'static [usize] {
     static V: OnceLock<&'static [usize]> = OnceLock::new();
     V.get_or_init(|| {
-        let mut v = vec![
+        let v = vec![
             add_ref as usize,
             release as usize,
             get_resource_layout as usize,
@@ -484,11 +484,9 @@ fn vtbl() -> &'static [usize] {
             not_implemented as usize,
             copy_into as usize,
             copy_from as usize,
+            get_subresource_info as usize,
+            get_subresource_info as usize,
         ];
-        for i in v.len()..12 {
-            let (stub, _) = crate::stubs::make_stub_info("xg_xs.dll", &format!("XGTextureAddressComputer::#{i}"), E_NOTIMPL as u32 as u64);
-            v.push(stub);
-        }
         Box::leak(v.into_boxed_slice())
     })
 }
@@ -648,6 +646,90 @@ unsafe extern "system" fn copy_from(p: *mut c_void, dst: *mut u8, plane: u32, su
     S_OK
 }
 
+/// The byte offset of a subresource (plane, subresource = mip + slice * mips) from the start of the resource.
+pub fn subresource_offset(t: &Texture, plane: u32, sub: u32) -> Option<u64> {
+    let (s, at, i, k) = subresource(t, plane, sub)?;
+    Some(at + k as u64 * s.chain.slice_bytes as u64 + s.mip_offset(i))
+}
+
+/// Writes `XG_SUBRESOURCE_LAYOUT` (0x70 bytes) for a subresource.
+pub fn write_subresource_layout(t: &Texture, plane: u32, sub: u32, out: &mut [u8]) -> bool {
+    let Some((s, at, i, k)) = subresource(t, plane, sub) else { return false };
+    if out.len() < 0x20 { return false; }
+    let len = out.len().min(MIP_BYTES);
+    out[..len].fill(0);
+    let m = &s.chain.levels[i];
+    let tail = i >= s.first_tail;
+    let (pw, ph) = s.padded(i);
+    let bytes = (pw * ph) as u64 * s.bpe as u64;
+    let (slices, padded_slices) = s.slices(i);
+    let total_bytes = if s.depth > 0 { bytes * padded_slices as u64 } else { bytes };
+    let sub_offset = at + k as u64 * s.chain.slice_bytes as u64 + s.mip_offset(i);
+    let row_pitch = pw as u32 * s.bpe;
+
+    let q = |b: &mut [u8], o: usize, v: u64| { if o + 8 <= b.len() { b[o..o + 8].copy_from_slice(&v.to_le_bytes()); } };
+    let w = |b: &mut [u8], o: usize, v: u32| { if o + 4 <= b.len() { b[o..o + 4].copy_from_slice(&v.to_le_bytes()); } };
+
+    q(out, 0, total_bytes);
+    q(out, 8, sub_offset);
+    q(out, 0x10, bytes);
+    w(out, 0x18, pw as u32 * s.side);
+    w(out, 0x1C, row_pitch);
+    w(out, 0x20, if tail { 0x100 } else { s.alignment() as u32 });
+    w(out, 0x24, pw as u32);
+    w(out, 0x28, ph as u32);
+    w(out, 0x2C, padded_slices);
+    w(out, 0x30, m.width as u32);
+    w(out, 0x34, m.height as u32);
+    w(out, 0x38, (s.width >> i).max(1));
+    w(out, 0x3C, (s.height >> i).max(1));
+    w(out, 0x40, slices);
+    w(out, 0x44, 1);
+    // the tail is in 256-byte tiles of the same kind (S 1, D 2, R 3; Z keeps its mode)
+    w(out, 0x48, if tail && !s.mode.is_multiple_of(4) { s.mode % 4 } else { s.mode });
+    if !tail && (24..=27).contains(&s.mode) {
+        w(out, 0x50, 0x8000);
+        w(out, 0x58, 0x8000);
+    }
+    w(out, 0x60, s.chain.layout.block_d as u32);
+    w(out, 0x64, tail as u32);
+    true
+}
+
+/// XGTextureAddressComputer methods #10 & #11:
+/// - `GetSubresourceLayout(plane, sub, outLayout) -> HRESULT`
+/// - `GetSubresourceLayout(sub, outLayout) -> HRESULT`
+/// - `GetSubresourceOffsetBytes(plane, sub) -> u64`
+/// - `GetSubresourceOffsetBytes(sub) -> u64`
+unsafe extern "system" fn get_subresource_info(p: *mut c_void, a1: u64, a2: u64, a3: *mut u8) -> u64 {
+    let t = tex(p);
+    let is_ptr = |ptr: usize| ptr >= 0x1_0000 && ptr < 0x8000_0000_0000;
+    let (plane, sub, out_ptr) = if is_ptr(a3 as usize) {
+        (a1 as u32, a2 as u32, Some(a3))
+    } else if is_ptr(a2 as usize) {
+        (0, a1 as u32, Some(a2 as *mut u8))
+    } else if subresource(t, a1 as u32, a2 as u32).is_some() {
+        (a1 as u32, a2 as u32, None)
+    } else {
+        (0, a1 as u32, None)
+    };
+
+    let Some(off) = subresource_offset(t, plane, sub) else {
+        return if out_ptr.is_some() { E_INVALIDARG as u32 as u64 } else { 0 };
+    };
+
+    if let Some(out) = out_ptr {
+        if !crate::gpu::shader::readable(out as usize, 0x20) {
+            return E_POINTER as u32 as u64;
+        }
+        let buf = std::slice::from_raw_parts_mut(out, MIP_BYTES);
+        write_subresource_layout(t, plane, sub, buf);
+        return S_OK as u32 as u64;
+    }
+
+    off
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -679,5 +761,21 @@ mod tests {
         assert_eq!(offsets, [0x20000, 0x10000, 0x8000, 0x4000, 0x2000, 0x1000, 0x800, 0x600, 0x500]);
         assert_eq!((mip(2, 0), mip(2, 9), mip(2, 10), mip(2, 18), mip(6, 9), mip(6, 10)), (0x8000, 0x40, 0x80, 1, 8, 8));
         assert_eq!(optimal_mode(0, 0, 32, 256, 256), 5);
+    }
+
+    #[test]
+    fn subresource_layout_and_offset() {
+        let t = Texture::new(&desc(256, 256, 1, 0, 28, 0x109)).unwrap();
+        assert_eq!(subresource_offset(&t, 0, 0), Some(0x20000));
+        assert_eq!(subresource_offset(&t, 0, 1), Some(0x10000));
+        assert_eq!(subresource_offset(&t, 0, 2), Some(0x8000));
+
+        let mut layout = [0u8; MIP_BYTES];
+        assert!(write_subresource_layout(&t, 0, 2, &mut layout));
+        let q = |o: usize| u64::from_le_bytes(layout[o..o + 8].try_into().unwrap());
+        let w = |o: usize| u32::from_le_bytes(layout[o..o + 4].try_into().unwrap());
+        assert_eq!(q(8), 0x8000);
+        assert_eq!(w(0x30), 64);
+        assert_eq!(w(0x34), 64);
     }
 }
