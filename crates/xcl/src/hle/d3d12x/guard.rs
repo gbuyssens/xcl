@@ -82,9 +82,31 @@ enum Tail {
     JumpToResult,
 }
 
-unsafe extern "system" fn trace(caller: usize, name: *const String) -> usize {
+/// `frame`: the thunk's stack at the call – the saved r9, r8, rdx, rcx at +0x68.., the return
+/// address at +0x88 and the caller's stack arguments from +0x90 + 0x20 (the shadow space).
+unsafe extern "system" fn trace(caller: usize, name: *const String, frame: *const u64) -> usize {
     if crate::modules::image_base_for_addr(caller).is_some() {
-        crate::xlog_info!("D3D12 trace: {} ← {}", *name, crate::modules::describe_address(caller));
+        let at = |off: usize| *frame.add(off / 8);
+        let (a1, a2, a3) = (at(0x78), at(0x70), at(0x68));
+        let (a4, a5) = (at(0x90 + 0x20), at(0x90 + 0x28));
+        // a pointer argument: what it points at (the first words of a descriptor, the hidden
+        // return slot of a struct-returning method, …)
+        let words = |p: u64| -> String {
+            if p > 0x10000 && crate::gpu::shader::readable(p as usize, 32) {
+                let w: Vec<String> = (0..4).map(|k| format!("{:#x}", *(p as *const u64).add(k))).collect();
+                format!(" -> [{}]", w.join(", "))
+            } else {
+                String::new()
+            }
+        };
+        crate::xlog_info!(
+            "D3D12 trace: {} ← {}: ({a1:#x}{}, {a2:#x}{}, {a3:#x}{}, {a4:#x}, {a5:#x})",
+            *name,
+            crate::modules::describe_address(caller),
+            words(a1),
+            words(a2),
+            words(a3)
+        );
     }
     0
 }
@@ -105,6 +127,7 @@ fn thunk(tail: Tail, data: u64, decide: usize) -> usize {
     c.extend_from_slice(&[0x48, 0x8B, 0x8C, 0x24, 0x88, 0x00, 0x00, 0x00]); // mov rcx, [rsp+0x88]
     c.extend_from_slice(&[0x48, 0xBA]); // mov rdx, imm64
     c.extend_from_slice(&data.to_le_bytes());
+    c.extend_from_slice(&[0x49, 0x89, 0xE0]); // mov r8, rsp (the saved registers and the caller's stack, for `trace`)
     c.extend_from_slice(&[0x48, 0xB8]); // mov rax, imm64
     c.extend_from_slice(&(decide as u64).to_le_bytes());
     c.extend_from_slice(&[0xFF, 0xD0]); // call rax
