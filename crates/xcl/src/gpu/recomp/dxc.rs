@@ -219,8 +219,8 @@ thread_local! {
 
 /// Run `f` with its DXC compiles done at once, on a thread of their own: not queued behind the
 /// background pipelines on the workers, not held by `wait_for_memory`. For a title thread that
-/// waits in its pipeline creation (no stand-in): GTA VI's watchdog kills the game when one of
-/// its threads stays silent ~30 s, and with commit short most workers sat in `wait_for_memory`
+/// waits in its pipeline creation (no stand-in): a title's watchdog may kill the process when
+/// one of its threads stays silent ~30 s, and with commit short most workers sat in `wait_for_memory`
 /// holding queued jobs while five title threads waited behind them.
 pub fn urgent<R>(f: impl FnOnce() -> R) -> R {
     let prev = URGENT.with(|u| u.replace(true));

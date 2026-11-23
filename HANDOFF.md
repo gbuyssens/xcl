@@ -1781,7 +1781,7 @@ to an outside server at every crash (`hle/netoff.rs`: the title's WinHTTP / Wins
 - XDefiant, Fortnite, Unicorn Overlord and Minecraft were **not** run after these changes (only the test suites).
 
 ## Console CPU instructions the PC lacks (2026-11-23)
-A retail game on an Intel CPU before Ice Lake / Alder Lake dies with 0xC000001D (illegal instruction) in its own code
+A title on an Intel CPU before Ice Lake / Alder Lake dies with 0xC000001D (illegal instruction) in its own code
 right after its first `CreateShaderResourceView` (the first descriptor written into title memory). `insn.rs` decodes
 the Zen 2 instructions such a CPU lacks – `clwb` (Intel: Ice Lake+), `clzero`, `rdpru`, `monitorx` / `mwaitx`
 (AMD only), `rdpid` – and the vectored handler (`eh::emulate_console_only`) emulates them and steps over
@@ -1789,7 +1789,7 @@ the Zen 2 instructions such a CPU lacks – `clwb` (Intel: Ice Lake+), `clzero`,
 QueryPerformanceCounter; `rdpid`: the processor number). Logged once per instruction. Any other illegal instruction
 (and `ud2`, a title's own trap) is logged with its 16 code bytes, in the first-chance handler and in the crash line.
 SHA-NI is not emulated (also missing on those CPUs): add it if a title's code bytes show `0F 38 C8..CD`.
-- With both emulated the retail game shows its first frame on an i5/i7 Coffee Lake + RTX 3060 too (`first game frame
+- With both emulated a title shows its first frame on an i5/i7 Coffee Lake + RTX 3060 too (`first game frame
   shown (3840x2160)`), then dies on an assert right after `chad.dll!XDspConnectWithMaximumStreamLimit` returned the
   stub's E_NOTIMPL. `chad.dll` (the console's audio DSP offload, `XDsp*`) is routed to `acphal` now: every XDsp
   function is acknowledged (S_OK; Connect writes a fake handle into its last pointer argument – the signatures are not

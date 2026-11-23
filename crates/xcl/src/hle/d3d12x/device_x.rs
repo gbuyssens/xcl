@@ -654,7 +654,7 @@ pub fn pc_resource_desc(x: &[u8; 0x38]) -> [u8; 0x38] {
     d[8..16].fill(0); // alignment: the driver's
     let layout = if dim == D3D12_RESOURCE_DIMENSION_BUFFER.0 as u32 { D3D12_TEXTURE_LAYOUT_ROW_MAJOR.0 } else { D3D12_TEXTURE_LAYOUT_UNKNOWN.0 };
     d[0x2C..0x30].copy_from_slice(&(layout as u32).to_le_bytes());
-    // a depth buffer the console also writes as a UAV (GTA VI's 2560x1440 D16S8): the PC refuses
+    // a depth buffer the console also writes as a UAV (seen: a 2560x1440 D16S8): the PC refuses
     // depth + unordered access together, and the resource got no size
     let pc_flags = if flags & 0x2 != 0 { flags & 0xFF & !0x4 } else { flags & 0xFF };
     d[0x30..0x34].copy_from_slice(&pc_flags.to_le_bytes());
@@ -665,7 +665,7 @@ pub fn pc_resource_desc(x: &[u8; 0x38]) -> [u8; 0x38] {
 
 /// A DXGI format of the console only as the PC's nearest: the 16-bit depth + 8-bit stencil
 /// family (118 D16_UNORM_S8_UINT, 119 R16_UNORM_X8_TYPELESS, 120 X16_TYPELESS_G8_UINT) as the
-/// 24-bit one (45, 46, 47). The PC driver refuses them: GTA VI's depth buffer got no size
+/// 24-bit one (45, 46, 47). The PC driver refuses them: a depth buffer in that format got no size
 /// (GetResourceAllocationInfo) and the title stopped on its assertion.
 pub fn pc_format(f: u32) -> u32 {
     match f {
@@ -791,7 +791,7 @@ pub(super) unsafe extern "system" fn create_placed_resource_x(this: *mut c_void,
     // PC's: the PC refused the resource (E_INVALIDARG) and the title threw
     let mut state = state & real::PC_RESOURCE_STATES;
     // a depth buffer is no UAV on the PC (`pc_resource_desc`): its unordered-access initial state
-    // (GTA VI's 768x768x6 shadow maps: 0x8) is refused – it starts as a depth target
+    // (seen on 768x768x6 shadow maps: 0x8) is refused – it starts as a depth target
     if u32::from_le_bytes(d[0x30..0x34].try_into().unwrap()) & 0x2 != 0 && state & 0x8 != 0 {
         state = (state & !0x8) | 0x10;
     }

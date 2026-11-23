@@ -103,8 +103,8 @@ pub fn submit(standin: usize, compute: bool, job: Job) {
 }
 
 /// Pipelines built at their first use (`submit_lazy`), `XCL_LAZY_PSO=0` to build each when
-/// the title creates it. A title can create far more pipelines than it draws with: the retail
-/// GTA VI creates ~51 000 different ones in its first 30 s; each a pipeline in AMD's driver
+/// the title creates it. A title can create far more pipelines than it draws with: one
+/// title creates ~51 000 different ones in its first 30 s; each a pipeline in AMD's driver
 /// (~400 KB of its heap) took 20 GB of commit and the system ran out.
 pub fn lazy() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
@@ -164,8 +164,8 @@ pub fn resolve(pso: usize) -> usize {
 pub fn resolve_wait(pso: usize) -> usize {
     let Some(p) = entry(pso) else { return pso };
     // not started yet: build it now instead of waiting behind the whole queue (thousands of
-    // pipelines while a title loads – GTA VI's watchdog killed the game while a title thread
-    // waited here), on a thread with the translator's stack, its compiles first
+    // pipelines while a title loads – a title's watchdog may kill the process while one of
+    // its threads waits here), on a thread with the translator's stack, its compiles first
     let job = p.job.lock().unwrap().take();
     if let Some(job) = job {
         let real = std::thread::scope(|s| {

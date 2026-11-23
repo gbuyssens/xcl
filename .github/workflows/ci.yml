@@ -1,5 +1,5 @@
 # Windows build and tests on every push and pull request.
-# GPU tests skip on the hosted runner (no D3D12 adapter) and the tests on retail game data
+# GPU tests skip on the hosted runner (no D3D12 adapter) and the tests on console sample data
 # pass without running (their XCL_SAMPLE_* variables are not set) – see scripts/test.ps1.
 name: CI
 

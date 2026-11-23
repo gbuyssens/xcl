@@ -1498,8 +1498,8 @@ fn forget_pso(pso: usize) {
 
 /// resource #11 GetGPUVirtualAddress for console code. On the console a texture has an address
 /// too: a texture the title placed at its own address answers with it (`title_address`) where
-/// the PC's answer is 0 – a retail game turns a texture's address into the CPU pointer it
-/// clears it through, and wrote 256 KB at address 0.
+/// the PC's answer is 0 – a title may turn a texture's address into the CPU pointer it
+/// clears it through, and then writes at address 0.
 unsafe extern "system" fn res_gpu_va_x(this: *mut c_void) -> u64 {
     if let Some((p, _)) = console_buffer(this as usize) {
         return p as u64;
@@ -3177,7 +3177,7 @@ unsafe fn standin_graphics(this: *mut c_void, f: PsoFn, desc: *const c_void, rii
     copy.InputLayout = D3D12_INPUT_LAYOUT_DESC::default();
     copy.CachedPSO = D3D12_CACHED_PIPELINE_STATE::default();
     // the console's topology types (rect list 19, none) are not the PC's: the driver refused
-    // GTA VI's stand-ins (0x80070057) and the title waited in the call for its compiles
+    // such stand-ins (0x80070057) and the title waited in the call for its compiles
     pc_topology_type(&mut copy);
     finish_pso(this, f, &copy as *const _ as *const c_void, riid, ppv)
 }
@@ -3659,7 +3659,7 @@ unsafe fn translated_gs_pso(this: *mut c_void, d: &D3D12_GRAPHICS_PIPELINE_STATE
 }
 
 /// A copy of the stream with its amplification / mesh shader subobjects numbered as the PC's
-/// (AS 24, MS 25) by the program kind in their bytecode, when the title's differ. GTA VI's
+/// (AS 24, MS 25) by the program kind in their bytecode, when the title's differ. Some titles'
 /// mesh pipelines carry their mesh shader (kind 13) as type 24: XCL found no MS, did not
 /// translate them and the driver refused them ("CreateAmplificationShader: ms_6_6").
 unsafe fn pc_stream_types(desc: *const c_void) -> Option<Vec<u8>> {
@@ -3777,7 +3777,7 @@ unsafe fn fallback_stream(desc: *const u8) -> Option<(Vec<u8>, [usize; 2])> {
         let at = off + poff;
         let put = |buf: &mut Vec<u8>, b: &[u8]| {
             // no shader: a null pointer – an empty slice's is dangling (0x1), which the driver
-            // refused (GTA VI's mesh stand-ins, 0x80070057) and the debug layer read
+            // refused (mesh stand-ins, 0x80070057) and the debug layer read
             let ptr = if b.is_empty() { 0 } else { b.as_ptr() as u64 };
             buf[at..at + 8].copy_from_slice(&ptr.to_le_bytes());
             buf[at + 8..at + 16].copy_from_slice(&(b.len() as u64).to_le_bytes());
@@ -3802,7 +3802,7 @@ unsafe fn fallback_stream(desc: *const u8) -> Option<(Vec<u8>, [usize; 2])> {
 /// without one) is TRIANGLE, or PATCH with a hull shader – the PC refuses both with a VS.
 fn pc_topology_type(g: &mut D3D12_GRAPHICS_PIPELINE_STATE_DESC) {
     // the console's own depth format DXGI_FORMAT_D16_UNORM_S8_UINT (118) is not the PC's: the
-    // driver refuses the pipeline (GTA VI's); D24_UNORM_S8_UINT has the depth and the stencil
+    // driver refuses the pipeline; D24_UNORM_S8_UINT has the depth and the stencil
     g.DSVFormat.0 = super::device_x::pc_format(g.DSVFormat.0 as u32) as i32;
     for f in g.RTVFormats.iter_mut() {
         f.0 = super::device_x::pc_format(f.0 as u32) as i32;
