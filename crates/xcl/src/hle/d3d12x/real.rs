@@ -1488,13 +1488,19 @@ fn forget_pso(pso: usize) {
     drop(gone);
 }
 
-/// resource #11 GetGPUVirtualAddress for console code
+/// resource #11 GetGPUVirtualAddress for console code. On the console a texture has an address
+/// too: a texture the title placed at its own address answers with it (`title_address`) where
+/// the PC's answer is 0 – a retail game turns a texture's address into the CPU pointer it
+/// clears it through, and wrote 256 KB at address 0.
 unsafe extern "system" fn res_gpu_va_x(this: *mut c_void) -> u64 {
     if let Some((p, _)) = console_buffer(this as usize) {
         return p as u64;
     }
     let f: unsafe extern "system" fn(*mut c_void) -> u64 = std::mem::transmute(orig_fn(this, 11));
-    f(this)
+    match f(this) {
+        0 => title_address(this as usize).map_or(0, |va| va as u64),
+        va => va,
+    }
 }
 
 fn note_buffer_view() {
