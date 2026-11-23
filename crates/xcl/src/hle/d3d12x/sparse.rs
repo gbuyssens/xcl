@@ -1221,6 +1221,14 @@ impl State {
     }
 }
 
+/// (tiles of title memory with video memory, pool heaps holding them) for the memory line
+/// (None: no sparse windows, or the state is busy – a crash report must not wait for it).
+pub fn stats() -> Option<(usize, usize)> {
+    let g = STATE.try_lock().ok()?;
+    let s = g.as_ref()?;
+    Some((s.mapped.len(), s.pools.len()))
+}
+
 /// The sparse windows' tiles with video memory as sorted (start, end) runs: where a CPU write
 /// has to reach the GPU.
 pub fn mapped_ranges() -> Vec<(usize, usize)> {

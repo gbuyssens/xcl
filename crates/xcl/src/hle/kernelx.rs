@@ -164,6 +164,7 @@ const MEM_64K_PAGES: u32 = 0x2040_0000;
 unsafe fn commit_sparse(a: usize, n: usize, p: u32) -> *mut c_void {
     let q = mem::VirtualAlloc(a as *const c_void, n, mem::MEM_COMMIT, sanitize_protect(p));
     if !q.is_null() {
+        crate::memstat::note(crate::memstat::GRAPHICS, n);
         crate::hle::d3d12x::sparse::committed(q as usize, n);
     }
     q
@@ -202,10 +203,12 @@ pub unsafe extern "system" fn VirtualAlloc(addr: *const c_void, size: usize, t: 
         };
         let rounded = size.max(1).div_ceil(align) * align;
         if let Some((q, _)) = crate::hle::d3d12x::sparse::alloc(rounded, align) {
+            crate::memstat::note(crate::memstat::GRAPHICS, rounded);
             trace_mem("VirtualAlloc (graphics, sparse VRAM)", 0, rounded, t as u64, p, q);
             return q as *mut c_void;
         }
         if let Some(q) = uma.and_then(|u| u.alloc(rounded, align)) {
+            crate::memstat::note(crate::memstat::GRAPHICS, rounded);
             trace_mem("VirtualAlloc (graphics, UMA)", 0, rounded, t as u64, p, q as usize);
             return q as *mut c_void;
         }
@@ -235,7 +238,11 @@ pub unsafe extern "system" fn VirtualAlloc(addr: *const c_void, size: usize, t: 
             return q;
         }
     }
-    let q = mem::VirtualAlloc(addr, size, sanitize_alloc_type(t), sanitize_protect(p));
+    let kind = sanitize_alloc_type(t);
+    let q = mem::VirtualAlloc(addr, size, kind, sanitize_protect(p));
+    if !q.is_null() && kind & mem::MEM_COMMIT != 0 {
+        crate::memstat::note(crate::memstat::WINDOWS, size);
+    }
     trace_mem("VirtualAlloc", addr as usize, size, t as u64, p, q as usize);
     q
 }
@@ -401,6 +408,9 @@ pub unsafe extern "system" fn XMemAllocDefault(size: usize, attrs: u64) -> *mut 
     let a = XAllocAttrs::decode(attrs);
     if a.memory_type == 0 {
         let q = aligned_heap_alloc(size, 1usize << a.alignment.clamp(4, usize::BITS - 2));
+        if !q.is_null() {
+            crate::memstat::note(crate::memstat::HEAP, size);
+        }
         trace_mem("XMemAlloc", 0, size, attrs, 0, q as usize);
         return q;
     }
@@ -410,14 +420,20 @@ pub unsafe extern "system" fn XMemAllocDefault(size: usize, attrs: u64) -> *mut 
     };
     // Graphics memory types live in the sparse VRAM pool (fallback to coherent UMA, then Windows).
     if let Some((q, _)) = crate::hle::d3d12x::sparse::alloc(rounded, align) {
+        crate::memstat::note(crate::memstat::GRAPHICS, rounded);
         trace_mem("XMemAlloc (graphics, sparse VRAM)", 0, rounded, attrs, 0, q);
         return q as *mut c_void;
     }
     if let Some(q) = crate::gpu::uma::get().and_then(|u| u.alloc(rounded, align)) {
+        crate::memstat::note(crate::memstat::GRAPHICS, rounded);
         trace_mem("XMemAlloc (graphics, UMA)", 0, rounded, attrs, 0, q as usize);
         return q as *mut c_void;
     }
-    mem::VirtualAlloc(std::ptr::null(), rounded, mem::MEM_COMMIT | mem::MEM_RESERVE, mem::PAGE_READWRITE)
+    let q = mem::VirtualAlloc(std::ptr::null(), rounded, mem::MEM_COMMIT | mem::MEM_RESERVE, mem::PAGE_READWRITE);
+    if !q.is_null() {
+        crate::memstat::note(crate::memstat::WINDOWS, rounded);
+    }
+    q
 }
 
 pub unsafe extern "system" fn XMemFreeDefault(p: *mut c_void, attrs: u64) {
@@ -800,6 +816,7 @@ unsafe fn home_again(home: usize) -> Option<usize> {
             crate::xlog_warn!("physical page: its home {home:#x} could not be committed again");
             return None;
         }
+        crate::memstat::note(crate::memstat::PHYSICAL, PHYS_PAGE);
         crate::hle::d3d12x::sparse::committed(home, PHYS_PAGE);
     }
     Some(home)
@@ -819,6 +836,7 @@ unsafe fn commit_homes(home: usize, n: usize) -> bool {
         crate::xlog_warn!("physical pages: {n} at their home {home:#x} could not be committed");
         return false;
     }
+    crate::memstat::note(crate::memstat::PHYSICAL, len);
     crate::hle::d3d12x::sparse::committed(home, len);
     true
 }
@@ -974,6 +992,9 @@ unsafe fn map_pages(away: &mut Away, va: *mut c_void, n: usize, arr: *mut usize)
         if !in_uma(at) && mem::VirtualAlloc(at as *const c_void, PHYS_PAGE, mem::MEM_COMMIT, mem::PAGE_READWRITE).is_null() {
             fnd::SetLastError(fnd::ERROR_INVALID_ADDRESS);
             return std::ptr::null_mut();
+        }
+        if fresh {
+            crate::memstat::note(crate::memstat::PHYSICAL, PHYS_PAGE);
         }
         let home = page_home(p).unwrap();
         if committed_page(home) {

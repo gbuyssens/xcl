@@ -1801,6 +1801,40 @@ SHA-NI is not emulated (also missing on those CPUs): add it if a title's code by
   published, the first call of each is logged with its arguments). `XCL_TRACE_IMPORTS=chad` traces stubs named by
   prefix too (arguments and result), for the next unknown DLL.
 
+## The memory wall, and the texture computer's slot 10 (2026-11-23)
+With chad.dll acknowledged the title on the i5/i7 + RTX 3060 (32 GB) runs far past its first frame (local user,
+~2000 graphics pipelines, mesh shaders, the video-memory arena), then dies writing to address 0 in its thread start-up
+code (`+0x2215c35`, `rbx = rbp = 0`) – a path every other thread took. Its own crash reporter says why: `memory.load_percent
+84`, `system.memory.swap.free 801176` of `48801508` KB. The page file (48 GB) is full, the commit charge about 75 GB; the
+three `graphics PSO rejected (0x8007000e)` just before are the driver's E_OUTOFMEMORY. An allocation returned NULL.
+- `memstat.rs`: one line, `memory: process commit … (working set …); system commit … of …, … of RAM free (… % load);
+  video … of … local, … of … shared; the title asked for graphics …, Windows …, heaps …, physical pages …; sparse windows
+  … tiles (…) in … pools`, logged at every crash (`eh::unhandled_filter`), when the process ends with an error, and from
+  a thread whenever the process's commit grew by a GiB (every 30 s at most). "The title asked for" are gross counters
+  (`memstat::note` in kernelx's commit paths: sparse / UMA graphics memory, Windows commits, XMemAlloc heaps, the
+  homes of physical pages); video memory is `IDXGIAdapter3::QueryVideoMemoryInfo` (local, and the non-local segment:
+  system memory the driver spills into when the pools of title memory outgrow the card – on a 12 GB card every GiB of
+  title memory beyond it costs a second GiB of commit). The next run says whose memory it is.
+- The crash line has the code bytes at RIP for every exception now (`(code bytes: …)`), not only illegal instructions.
+- `xg_xs.dll` of a GDK (an older one: no `XGSuggestSwizzleMode`), disassembled: `XGCreateTextureComputer` is
+  `(desc, out)` → the factory at `+0x5dd0`; the computer's vtable (at `+0x50b68`, referenced from `+0x1852`) has 13 slots.
+  #10 is **GetResourceTiling** – `ID3D12Device::GetResourceTiling`'s six arguments, for the computer's resource: it reads
+  `*pNumSubresourceTilings`, writes a `D3D12_PACKED_MIP_INFO` (12 bytes), a `D3D12_TILE_SHAPE` (12), `D3D12_SUBRESOURCE_TILING`s
+  (12 each, indexed by D3D12 subresource skipping the packed levels). E_FAIL "Resource does not have a 64KB swizzle mode
+  compatible with tiled resources" unless the mode is 8–11 / 16–19 / 24–27; E_NOTIMPL "Texture1D and Texture3D is not
+  implemented yet"; the standard tile in elements by their size (256×256 … 64×64 for 1 … 16 bytes, halved per MSAA
+  doubling), reported in texels; a level's tiling is its padded size over the tile, its start tile the level's offset
+  in 64 KiB tiles plus the slice's; the packed levels one tile at the first one's offset. `xg::get_resource_tiling`
+  does this (test `resource_tiling_of_a_64kb_texture`). The guess merged from ivall/xcl#169 (GetSubresourceLayout /
+  Offset, sniffing which arguments are pointers) is gone: with the real arguments it answered E_INVALIDARG by luck (the
+  "plane" was the low half of a pointer) and would have written 0x70 bytes over a 12-byte tile shape otherwise.
+  #11 is `GetDescriptor(UINT plane, void* descriptor)`: "pDescriptor cannot be NULL", "PlaneIndex must be less than 3",
+  copies the plane's 32-byte hardware texture descriptor (not modelled, still a stub). #12 returns a flag byte of the
+  resource (bit 27 of a dword at `+0x2818`). A title's texture streaming calls #10 for every texture it places in a
+  tiled pool (179 calls in one run).
+- Scripts for the DLL (in the session's scratch, not the repo): a PE reader (`fo(va)`, `q(va)`), a scan of `.rdata` for
+  runs of code pointers (vtables), `x86_64-w64-mingw32-objdump -d -M intel --start-address … --stop-address …`.
+
 ## Next steps (priority)
 Little is left to do without the exe – the rest needs an actual run of the game.
 1. Once the user has a legal game exe: `xcl inspect`, `xcl run`, analysis of `report.json`
