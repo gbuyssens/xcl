@@ -355,6 +355,14 @@ pub fn init() -> Result<String, String> {
                 }
                 Err(e) => {
                     crate::xlog_warn!("D3D12: debug layer requested but unavailable: {e}");
+                    // DXGI_ERROR_SDK_COMPONENT_MISSING: the layer ships with Windows' optional
+                    // "Graphics Tools" feature, not with the driver.
+                    if e.code().0 as u32 == 0x887A_002D {
+                        crate::xlog_warn!(
+                            "D3D12: install it from an administrator prompt with `dism /online /add-capability /capabilityname:Tools.Graphics.DirectX~~~~0.0.1.0` \
+                             (or Settings > Optional features > Graphics Tools); XCL_DRED=1 reports device removals without it"
+                        );
+                    }
                 }
             }
         }
