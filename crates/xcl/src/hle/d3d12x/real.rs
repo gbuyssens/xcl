@@ -3585,6 +3585,12 @@ unsafe fn fallback_stream(desc: *const u8) -> Option<(Vec<u8>, [usize; 2])> {
 /// `list_x::RECT_LIST`) is TRIANGLE, as those draws become triangle lists; UNDEFINED (a stream
 /// without one) is TRIANGLE, or PATCH with a hull shader – the PC refuses both with a VS.
 fn pc_topology_type(g: &mut D3D12_GRAPHICS_PIPELINE_STATE_DESC) {
+    // the console's own depth format DXGI_FORMAT_D16_UNORM_S8_UINT (118) is not the PC's: the
+    // driver refuses the pipeline (GTA VI's); D24_UNORM_S8_UINT has the depth and the stencil
+    g.DSVFormat.0 = super::device_x::pc_format(g.DSVFormat.0 as u32) as i32;
+    for f in g.RTVFormats.iter_mut() {
+        f.0 = super::device_x::pc_format(f.0 as u32) as i32;
+    }
     if !(1..=4).contains(&g.PrimitiveTopologyType.0) {
         g.PrimitiveTopologyType = if g.HS.pShaderBytecode.is_null() { D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE } else { D3D12_PRIMITIVE_TOPOLOGY_TYPE_PATCH };
     }
