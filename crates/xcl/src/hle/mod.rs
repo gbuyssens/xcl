@@ -174,7 +174,7 @@ fn build(config: &Config) -> Registry {
     let g = idx(XG);
     routes.push((XG.into(), Route::Hle(g)));
     let ap = idx(ACPHAL);
-    for p in ["acphal.dll", "xapu.dll"] {
+    for p in ["acphal.dll", "xapu.dll", "chad.dll"] {
         routes.push((p.into(), Route::Hle(ap)));
     }
     let gi = idx(GAMEINPUT);

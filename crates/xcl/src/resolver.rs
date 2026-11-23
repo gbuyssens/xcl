@@ -304,7 +304,8 @@ impl TraceFilter {
             return false;
         }
         match source {
-            Source::Stub => false, // a stub logs its own calls
+            // a stub logs its own calls – without arguments: named by a prefix, it is traced too
+            Source::Stub => self.include.iter().any(|p| full.starts_with(p.as_str())),
             Source::Hle(_) | Source::HleOther(_) if self.hle => true,
             _ => self.all || self.include.iter().any(|p| full.starts_with(p.as_str())),
         }

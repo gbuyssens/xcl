@@ -717,8 +717,72 @@ pub unsafe extern "system" fn XApuGetUtilization(_a: u32, _b: u32, u: *mut u32) 
     S_OK
 }
 
+// ---------------------------------------------------------------------------------------
+// chad.dll – the console's audio DSP offload (XDsp*). A retail game connects to it right
+// after the decoder and asserts on anything but S_OK. Its signatures are not published: the
+// first call of each function is logged with its arguments, every call is acknowledged and
+// nothing runs (as for the SHAPE contexts and the decoder).
+// ---------------------------------------------------------------------------------------
+
+/// The first call of an XDsp function: its arguments, with what pointer arguments point at.
+fn xdsp_note(what: &'static str, args: [usize; 4]) {
+    static SEEN: Mutex<Vec<&'static str>> = Mutex::new(Vec::new());
+    let Ok(mut seen) = SEEN.lock() else { return };
+    if seen.contains(&what) {
+        return;
+    }
+    seen.push(what);
+    let show = |a: usize| -> String {
+        if a > 0x10000 && crate::gpu::shader::readable(a, 32) {
+            let w: Vec<String> = (0..4).map(|k| format!("{:#x}", unsafe { (a as *const u64).add(k).read_unaligned() })).collect();
+            format!("{a:#x} -> [{}]", w.join(", "))
+        } else {
+            format!("{a:#x}")
+        }
+    };
+    crate::xlog_info!("chad: {what}({}, {}, {}, {}) – acknowledged, nothing runs", show(args[0]), show(args[1]), show(args[2]), show(args[3]));
+}
+
+/// A fake DSP connection handle (non-null, never dereferenced by XCL).
+const XDSP_HANDLE: usize = 0x5D5B_0001;
+
+/// `XDspConnectWithMaximumStreamLimit(…)`: the last pointer argument is taken as the out
+/// handle and gets a non-null one.
+pub unsafe extern "system" fn XDspConnectWithMaximumStreamLimit(a: usize, b: usize, c: usize, d: usize) -> HRESULT {
+    xdsp_note("XDspConnectWithMaximumStreamLimit", [a, b, c, d]);
+    if let Some(out) = [d, c, b, a].into_iter().find(|&p| p > 0x10000 && p % 8 == 0 && crate::gpu::shader::readable(p, 8)) {
+        (out as *mut usize).write(XDSP_HANDLE);
+    }
+    S_OK
+}
+
+pub unsafe extern "system" fn XDspDisconnect(a: usize, b: usize, c: usize, d: usize) -> HRESULT {
+    xdsp_note("XDspDisconnect", [a, b, c, d]);
+    S_OK
+}
+
+pub unsafe extern "system" fn XDspActivate(a: usize, b: usize, c: usize, d: usize) -> HRESULT {
+    xdsp_note("XDspActivate", [a, b, c, d]);
+    S_OK
+}
+
+pub unsafe extern "system" fn XDspDeactivate(a: usize, b: usize, c: usize, d: usize) -> HRESULT {
+    xdsp_note("XDspDeactivate", [a, b, c, d]);
+    S_OK
+}
+
+pub unsafe extern "system" fn XDspSubmitCommand(a: usize, b: usize, c: usize, d: usize) -> HRESULT {
+    xdsp_note("XDspSubmitCommand", [a, b, c, d]);
+    S_OK
+}
+
 pub fn exports() -> Vec<(&'static str, usize)> {
     crate::hle_exports![
+        XDspConnectWithMaximumStreamLimit,
+        XDspDisconnect,
+        XDspActivate,
+        XDspDeactivate,
+        XDspSubmitCommand,
         ApuCreateHeap,
         ApuAlloc,
         ApuFree,
