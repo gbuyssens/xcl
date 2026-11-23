@@ -33,6 +33,7 @@ use crate::util::{HRESULT, S_OK};
 const E_NOTIMPL: HRESULT = 0x8000_4001u32 as i32;
 const E_POINTER: HRESULT = 0x8000_4003u32 as i32;
 const E_INVALIDARG: HRESULT = 0x8007_0057u32 as i32;
+const E_FAIL: HRESULT = 0x8000_4005u32 as i32;
 
 pub const LAYOUT_BYTES: usize = 0x1B40;
 const PLANE: usize = 0x18;
@@ -473,7 +474,7 @@ struct Computer {
 fn vtbl() -> &'static [usize] {
     static V: OnceLock<&'static [usize]> = OnceLock::new();
     V.get_or_init(|| {
-        let v = vec![
+        let mut v = vec![
             add_ref as usize,
             release as usize,
             get_resource_layout as usize,
@@ -484,9 +485,15 @@ fn vtbl() -> &'static [usize] {
             not_implemented as usize,
             copy_into as usize,
             copy_from as usize,
-            get_subresource_info as usize,
-            get_subresource_info as usize,
+            get_resource_tiling as usize,
         ];
+        // #11 `HRESULT GetDescriptor(UINT plane, void* descriptor)`: the plane's 32-byte hardware
+        // texture descriptor (planes 0–2, E_INVALIDARG beyond) – not modelled; #12 a flag of the
+        // resource (a byte); the slots after them belong to newer libraries
+        for i in v.len()..16 {
+            let (stub, _) = crate::stubs::make_stub_info("xg_xs.dll", &format!("XGTextureAddressComputer::#{i}"), E_NOTIMPL as u32 as u64);
+            v.push(stub);
+        }
         Box::leak(v.into_boxed_slice())
     })
 }
@@ -646,88 +653,83 @@ unsafe extern "system" fn copy_from(p: *mut c_void, dst: *mut u8, plane: u32, su
     S_OK
 }
 
-/// The byte offset of a subresource (plane, subresource = mip + slice * mips) from the start of the resource.
-pub fn subresource_offset(t: &Texture, plane: u32, sub: u32) -> Option<u64> {
-    let (s, at, i, k) = subresource(t, plane, sub)?;
-    Some(at + k as u64 * s.chain.slice_bytes as u64 + s.mip_offset(i))
-}
-
-/// Writes `XG_SUBRESOURCE_LAYOUT` (0x70 bytes) for a subresource.
-pub fn write_subresource_layout(t: &Texture, plane: u32, sub: u32, out: &mut [u8]) -> bool {
-    let Some((s, at, i, k)) = subresource(t, plane, sub) else { return false };
-    if out.len() < 0x20 { return false; }
-    let len = out.len().min(MIP_BYTES);
-    out[..len].fill(0);
-    let m = &s.chain.levels[i];
-    let tail = i >= s.first_tail;
-    let (pw, ph) = s.padded(i);
-    let bytes = (pw * ph) as u64 * s.bpe as u64;
-    let (slices, padded_slices) = s.slices(i);
-    let total_bytes = if s.depth > 0 { bytes * padded_slices as u64 } else { bytes };
-    let sub_offset = at + k as u64 * s.chain.slice_bytes as u64 + s.mip_offset(i);
-    let row_pitch = pw as u32 * s.bpe;
-
-    let q = |b: &mut [u8], o: usize, v: u64| { if o + 8 <= b.len() { b[o..o + 8].copy_from_slice(&v.to_le_bytes()); } };
-    let w = |b: &mut [u8], o: usize, v: u32| { if o + 4 <= b.len() { b[o..o + 4].copy_from_slice(&v.to_le_bytes()); } };
-
-    q(out, 0, total_bytes);
-    q(out, 8, sub_offset);
-    q(out, 0x10, bytes);
-    w(out, 0x18, pw as u32 * s.side);
-    w(out, 0x1C, row_pitch);
-    w(out, 0x20, if tail { 0x100 } else { s.alignment() as u32 });
-    w(out, 0x24, pw as u32);
-    w(out, 0x28, ph as u32);
-    w(out, 0x2C, padded_slices);
-    w(out, 0x30, m.width as u32);
-    w(out, 0x34, m.height as u32);
-    w(out, 0x38, (s.width >> i).max(1));
-    w(out, 0x3C, (s.height >> i).max(1));
-    w(out, 0x40, slices);
-    w(out, 0x44, 1);
-    // the tail is in 256-byte tiles of the same kind (S 1, D 2, R 3; Z keeps its mode)
-    w(out, 0x48, if tail && !s.mode.is_multiple_of(4) { s.mode % 4 } else { s.mode });
-    if !tail && (24..=27).contains(&s.mode) {
-        w(out, 0x50, 0x8000);
-        w(out, 0x58, 0x8000);
-    }
-    w(out, 0x60, s.chain.layout.block_d as u32);
-    w(out, 0x64, tail as u32);
-    true
-}
-
-/// XGTextureAddressComputer methods #10 & #11:
-/// - `GetSubresourceLayout(plane, sub, outLayout) -> HRESULT`
-/// - `GetSubresourceLayout(sub, outLayout) -> HRESULT`
-/// - `GetSubresourceOffsetBytes(plane, sub) -> u64`
-/// - `GetSubresourceOffsetBytes(sub) -> u64`
-unsafe extern "system" fn get_subresource_info(p: *mut c_void, a1: u64, a2: u64, a3: *mut u8) -> u64 {
+/// Slot 10 of the computer, `HRESULT GetResourceTiling(UINT* pNumTilesForEntireResource,
+/// D3D12_PACKED_MIP_INFO* pPackedMipDesc, D3D12_TILE_SHAPE* pStandardTileShapeForNonPackedMips,
+/// UINT* pNumSubresourceTilings, UINT FirstSubresourceTilingToGet, D3D12_SUBRESOURCE_TILING*
+/// pSubresourceTilingsForNonPackedMips)`: ID3D12Device::GetResourceTiling for the computer's
+/// resource, as the console's library answers it (read from its code). A 64 KiB swizzle mode is
+/// required (8–11, 16–19, 24–27; others: E_FAIL), Texture2D only (1D and 3D: E_NOTIMPL). The
+/// standard tile in elements goes by their size – 256×256 for 1 byte, 256×128 for 2, 128×128
+/// for 4, 128×64 for 8, 64×64 for 16 – and is reported in texels (× the element's side). A
+/// standard level's tiling is its padded size over the tile, its start tile the level's offset
+/// in 64 KiB tiles plus the slice's; the packed levels take one tile at the first one's offset.
+/// The tilings are indexed by D3D12 subresource (level + slice × levels) skipping the packed
+/// levels; `*pNumSubresourceTilings` is the room on entry and the count written on return. A
+/// title's texture streaming asks this for every texture it places in a tiled pool.
+unsafe extern "system" fn get_resource_tiling(p: *mut c_void, num_tiles: *mut u32, packed: *mut u8, shape: *mut u32, num_sub: *mut u32, first: u32, tilings: *mut u8) -> HRESULT {
     let t = tex(p);
-    let is_ptr = |ptr: usize| ptr >= 0x1_0000 && ptr < 0x8000_0000_0000;
-    let (plane, sub, out_ptr) = if is_ptr(a3 as usize) {
-        (a1 as u32, a2 as u32, Some(a3))
-    } else if is_ptr(a2 as usize) {
-        (0, a1 as u32, Some(a2 as *mut u8))
-    } else if subresource(t, a1 as u32, a2 as u32).is_some() {
-        (a1 as u32, a2 as u32, None)
-    } else {
-        (0, a1 as u32, None)
-    };
-
-    let Some(off) = subresource_offset(t, plane, sub) else {
-        return if out_ptr.is_some() { E_INVALIDARG as u32 as u64 } else { 0 };
-    };
-
-    if let Some(out) = out_ptr {
-        if !crate::gpu::shader::readable(out as usize, 0x20) {
-            return E_POINTER as u32 as u64;
-        }
-        let buf = std::slice::from_raw_parts_mut(out, MIP_BYTES);
-        write_subresource_layout(t, plane, sub, buf);
-        return S_OK as u32 as u64;
+    if t.dimension != 3 {
+        return E_NOTIMPL;
     }
-
-    off
+    let Some((s, at)) = t.plane_surface(t.main as u32) else { return E_FAIL };
+    if !matches!(s.mode, 8..=11 | 16..=19 | 24..=27) {
+        return E_FAIL;
+    }
+    let (tw, th): (usize, usize) = match s.bpe {
+        1 => (256, 256),
+        2 => (256, 128),
+        4 => (128, 128),
+        8 => (128, 64),
+        16 => (64, 64),
+        _ => return E_INVALIDARG,
+    };
+    let mips = s.chain.levels.len();
+    let standard = s.first_tail.min(mips);
+    let tile = |offset: u64| (offset >> 16) as u32;
+    if !num_tiles.is_null() {
+        num_tiles.write_unaligned(tile(t.size()));
+    }
+    if !shape.is_null() {
+        shape.write_unaligned(tw as u32 * s.side);
+        shape.add(1).write_unaligned(th as u32 * s.side);
+        shape.add(2).write_unaligned(1);
+    }
+    if !packed.is_null() {
+        let any = standard < mips;
+        let mut b = [0u8; 12];
+        b[0] = standard as u8;
+        b[1] = (mips - standard) as u8;
+        b[4..8].copy_from_slice(&(any as u32).to_le_bytes());
+        b[8..12].copy_from_slice(&if any { tile(at + s.mip_offset(standard)) } else { 0 }.to_le_bytes());
+        std::ptr::copy_nonoverlapping(b.as_ptr(), packed, b.len());
+    }
+    let room = if num_sub.is_null() { 0 } else { num_sub.read_unaligned() };
+    if !num_sub.is_null() {
+        num_sub.write_unaligned(0);
+    }
+    if room == 0 || tilings.is_null() {
+        return S_OK;
+    }
+    let per_slice = tile(s.chain.slice_bytes as u64);
+    let mut written = 0u32;
+    for k in 0..s.array as usize {
+        for i in 0..standard {
+            let idx = (k * mips + i) as u32;
+            if idx < first || idx - first >= room {
+                continue;
+            }
+            let (pw, ph) = s.padded(i);
+            let mut b = [0u8; 12];
+            b[0..4].copy_from_slice(&(pw.div_ceil(tw) as u32).to_le_bytes());
+            b[4..6].copy_from_slice(&(ph.div_ceil(th) as u16).to_le_bytes());
+            b[6..8].copy_from_slice(&1u16.to_le_bytes());
+            b[8..12].copy_from_slice(&(k as u32 * per_slice + tile(at + s.mip_offset(i))).to_le_bytes());
+            std::ptr::copy_nonoverlapping(b.as_ptr(), tilings.add((idx - first) as usize * b.len()), b.len());
+            written += 1;
+        }
+    }
+    num_sub.write_unaligned(written);
+    S_OK
 }
 
 #[cfg(test)]
@@ -763,19 +765,25 @@ mod tests {
         assert_eq!(optimal_mode(0, 0, 32, 256, 256), 5);
     }
 
+    /// RGBA8 256×256, full chain, 64KB_S: 6 tiles, two standard levels (4 tiles from tile 2,
+    /// 1 tile at tile 1), seven packed in one tile at tile 0, a 128×128 standard tile.
     #[test]
-    fn subresource_layout_and_offset() {
-        let t = Texture::new(&desc(256, 256, 1, 0, 28, 0x109)).unwrap();
-        assert_eq!(subresource_offset(&t, 0, 0), Some(0x20000));
-        assert_eq!(subresource_offset(&t, 0, 1), Some(0x10000));
-        assert_eq!(subresource_offset(&t, 0, 2), Some(0x8000));
-
-        let mut layout = [0u8; MIP_BYTES];
-        assert!(write_subresource_layout(&t, 0, 2, &mut layout));
-        let q = |o: usize| u64::from_le_bytes(layout[o..o + 8].try_into().unwrap());
-        let w = |o: usize| u32::from_le_bytes(layout[o..o + 4].try_into().unwrap());
-        assert_eq!(q(8), 0x8000);
-        assert_eq!(w(0x30), 64);
-        assert_eq!(w(0x34), 64);
+    fn resource_tiling_of_a_64kb_texture() {
+        let mut c = Computer { vtbl: std::ptr::null(), refs: AtomicU32::new(1), tex: Texture::new(&desc(256, 256, 1, 0, 28, 0x109)).unwrap() };
+        let (mut n, mut packed, mut shape, mut count, mut tilings) = (0u32, [0u8; 12], [0u32; 3], 4u32, [0u8; 48]);
+        let hr = unsafe { get_resource_tiling(&mut c as *mut Computer as *mut c_void, &mut n, packed.as_mut_ptr(), shape.as_mut_ptr(), &mut count, 0, tilings.as_mut_ptr()) };
+        assert_eq!((hr, n, shape, count), (S_OK, 6, [128, 128, 1], 2));
+        let w = |b: &[u8], o: usize| u32::from_le_bytes(b[o..o + 4].try_into().unwrap());
+        assert_eq!((packed[0], packed[1], w(&packed, 4), w(&packed, 8)), (2, 7, 1, 0));
+        let h = |b: &[u8], o: usize| u16::from_le_bytes(b[o..o + 2].try_into().unwrap());
+        assert_eq!((w(&tilings, 0), h(&tilings, 4), h(&tilings, 6), w(&tilings, 8)), (2, 2, 1, 2));
+        assert_eq!((w(&tilings, 12), h(&tilings, 16), h(&tilings, 18), w(&tilings, 20)), (1, 1, 1, 1));
+        // only the second standard level asked for
+        let (mut count, mut one) = (1u32, [0u8; 12]);
+        let hr = unsafe { get_resource_tiling(&mut c as *mut Computer as *mut c_void, std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut(), &mut count, 1, one.as_mut_ptr()) };
+        assert_eq!((hr, count, w(&one, 0), w(&one, 8)), (S_OK, 1, 1, 1));
+        // a 4 KiB mode has no tiled-resource layout
+        c.tex = Texture::new(&desc(64, 64, 1, 1, 28, 0x105)).unwrap();
+        assert_eq!(unsafe { get_resource_tiling(&mut c as *mut Computer as *mut c_void, &mut n, std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut(), 0, std::ptr::null_mut()) }, E_FAIL);
     }
 }
