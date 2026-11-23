@@ -1531,7 +1531,11 @@ fn note_buffer_view() {
 unsafe extern "system" fn dev_create_cbv_x(this: *mut c_void, desc: *const D3D12_CONSTANT_BUFFER_VIEW_DESC, cpu: u64) {
     let Some(slot) = super::console_heap::slot(cpu).filter(|s| !s.sampler) else {
         let f: unsafe extern "system" fn(*mut c_void, *const D3D12_CONSTANT_BUFFER_VIEW_DESC, u64) = std::mem::transmute(orig_fn(this, 17));
-        return f(this, desc, cpu);
+        f(this, desc, cpu);
+        return note_removal_after(|| {
+            let (va, size) = desc.as_ref().map_or((0, 0), |d| (d.BufferLocation, d.SizeInBytes));
+            format!("CreateConstantBufferView (address {va:#x}, {size} bytes)")
+        });
     };
     let (va, size) = desc.as_ref().map_or((0, 0), |d| (d.BufferLocation, d.SizeInBytes));
     let in_uma = crate::gpu::uma::get().is_some_and(|u| u.contains(va as usize));
@@ -1546,8 +1550,12 @@ unsafe extern "system" fn dev_create_cbv_x(this: *mut c_void, desc: *const D3D12
 /// [11:0] = sampler heap index; the state lives in the PC sampler).
 pub(super) unsafe extern "system" fn dev_create_sampler_x(this: *mut c_void, desc: *const D3D12_SAMPLER_DESC, cpu: u64) {
     let f: unsafe extern "system" fn(*mut c_void, *const D3D12_SAMPLER_DESC, u64) = std::mem::transmute(orig_fn(this, 22));
-    let Some(slot) = super::console_heap::slot(cpu).filter(|s| s.sampler) else { return f(this, desc, cpu) };
+    let Some(slot) = super::console_heap::slot(cpu).filter(|s| s.sampler) else {
+        f(this, desc, cpu);
+        return note_removal_after(|| "CreateSampler".into());
+    };
     f(this, desc, slot.pc_srv);
+    note_removal_after(|| "CreateSampler".into());
     super::console_heap::write(&slot, &[0, 0, 0, slot.index & 0xFFF]);
 }
 
@@ -1604,6 +1612,7 @@ unsafe extern "system" fn dev_copy_descriptors_simple_x(this: *mut c_void, n: u3
     }
     let f: unsafe extern "system" fn(*mut c_void, u32, u64, u64, u32) = std::mem::transmute(orig_fn(this, 24));
     f(this, n, dst, src, ty);
+    note_removal_after(|| format!("CopyDescriptorsSimple ({n} from {src:#x} to {dst:#x}, type {ty})"));
 }
 
 /// #23 CopyDescriptors(dst ranges, src ranges, type): range by range over console slots.
@@ -1620,7 +1629,8 @@ unsafe extern "system" fn dev_copy_descriptors_x(this: *mut c_void, nd: u32, dst
         }
         type F = unsafe extern "system" fn(*mut c_void, u32, *const u64, *const u32, u32, *const u64, *const u32, u32);
         let f: F = std::mem::transmute(orig_fn(this, 23));
-        return f(this, nd, dsts, dsizes, ns, srcs, ssizes, ty);
+        f(this, nd, dsts, dsizes, ns, srcs, ssizes, ty);
+        return note_removal_after(|| format!("CopyDescriptors ({nd} range(s) from {ns}, type {ty})"));
     }
     // every descriptor as (dst, src) handle, ranges walked in step
     let step = if ty == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER.0 as u32 { SAMPLER_SLOT } else { SLOT } as u64;
@@ -1651,7 +1661,12 @@ unsafe extern "system" fn heap_release(this: *mut c_void) -> u32 {
 
 unsafe extern "system" fn dev_create_srv_x(this: *mut c_void, res: *mut c_void, desc: *const D3D12_SHADER_RESOURCE_VIEW_DESC, cpu: u64) {
     let f: unsafe extern "system" fn(*mut c_void, *mut c_void, *const D3D12_SHADER_RESOURCE_VIEW_DESC, u64) = std::mem::transmute(orig_fn(this, 18));
-    let Some(slot) = super::console_heap::slot(cpu) else { return f(this, res, desc, cpu) };
+    let pd = pc_view_desc(desc);
+    let pdesc = pd.as_ref().map_or(desc, |d| d as *const D3D12_SHADER_RESOURCE_VIEW_DESC);
+    let Some(slot) = super::console_heap::slot(cpu) else {
+        f(this, res, pdesc, cpu);
+        return note_after_view("CreateShaderResourceView", res, desc as *const u32);
+    };
     // Raytracing acceleration structure SRV (pResource == NULL, Location == console GPU VA):
     // translated shaders read BVH nodes from UMA (`bvh_intersect`), never from a PC DXR SRV,
     // so write the RDNA2 BVH descriptor directly and skip forwarding the console VA to PC.
@@ -1668,7 +1683,8 @@ unsafe extern "system" fn dev_create_srv_x(this: *mut c_void, res: *mut c_void, 
         }
         return super::console_heap::write(&slot, &[0; 8]);
     }
-    f(this, res, desc, slot.pc_srv);
+    f(this, res, pdesc, slot.pc_srv);
+    note_after_view("CreateShaderResourceView", res, desc as *const u32);
     super::console_heap::publish(&slot, false);
     super::console_heap::note_resource(&slot, res as usize);
     if super::present::trace_frame() && super::title_textures::address(res as usize).is_some() {
@@ -1808,8 +1824,14 @@ unsafe extern "system" fn dev_create_uav_x(this: *mut c_void, res: *mut c_void, 
             crate::xlog_info!("frame trace: UAV of render target {res:p} {:?} at {cpu:#x}: console slot {:?}, view {:?}", d.map(|d| (d.Width, d.Height, d.Format.0)), s.as_ref().map(|s| (s.index, s.pc_uav, s.at)), desc.as_ref().map(|v| (v.Format.0, v.ViewDimension.0)));
         }
     }
-    let Some(slot) = super::console_heap::slot(cpu) else { return f(this, res, counter, desc, cpu) };
-    f(this, res, counter, desc, slot.pc_uav);
+    let pd = pc_view_desc(desc);
+    let pdesc = pd.as_ref().map_or(desc, |d| d as *const D3D12_UNORDERED_ACCESS_VIEW_DESC);
+    let Some(slot) = super::console_heap::slot(cpu) else {
+        f(this, res, counter, pdesc, cpu);
+        return note_after_view("CreateUnorderedAccessView", res, desc as *const u32);
+    };
+    f(this, res, counter, pdesc, slot.pc_uav);
+    note_after_view("CreateUnorderedAccessView", res, desc as *const u32);
     super::console_heap::publish(&slot, true);
     super::console_heap::note_resource(&slot, res as usize);
     let Some(r) = ID3D12Resource::from_raw_borrowed(&res) else {
@@ -1999,6 +2021,7 @@ fn overrides(kind: Kind) -> Vec<(&'static str, usize)> {
             ("CreateDescriptorHeap", dev_create_descriptor_heap as usize),
             ("CreateRootSignature", dev_create_root_signature as usize),
             ("CreateRenderTargetView", dev_create_rtv as usize),
+            ("CreateDepthStencilView", dev_create_dsv as usize),
             ("CreateCommittedResource", dev_create_committed_resource as usize),
             ("CreateHeap", dev_create_heap as usize),
             ("CreatePlacedResource", dev_create_placed_resource as usize),
@@ -2748,6 +2771,7 @@ unsafe fn finish_pso(this: *mut c_void, f: PsoFn, desc: *const c_void, riid: *co
     if hr >= 0 && !ppv.is_null() && !(*ppv).is_null() {
         adopt(*ppv, Kind::PipelineState);
     }
+    note_removal_after(|| format!("a pipeline creation ({hr:#x})"));
     hr
 }
 
@@ -4153,10 +4177,50 @@ unsafe extern "system" fn dev_create_root_signature(this: *mut c_void, mask: u32
 // presentation tracking
 // ---------------------------------------------------------------------------------------
 
+/// CreateDepthStencilView: the console-only depth formats as the PC's (`pc_format`, as the
+/// resources were made); a device removal right after it is logged with the view.
+unsafe extern "system" fn dev_create_dsv(this: *mut c_void, res: *mut c_void, desc: *const D3D12_DEPTH_STENCIL_VIEW_DESC, handle: usize) {
+    type F = unsafe extern "system" fn(*mut c_void, *mut c_void, *const D3D12_DEPTH_STENCIL_VIEW_DESC, usize);
+    let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "CreateDepthStencilView")));
+    let pd = pc_view_desc(desc);
+    f(this, res, pd.as_ref().map_or(desc, |d| d as *const D3D12_DEPTH_STENCIL_VIEW_DESC), handle);
+    note_after_view("CreateDepthStencilView", res, desc as *const u32);
+}
+
+/// A view description with the console-only depth formats as the PC's (`device_x::pc_format`:
+/// the resources in those formats were made in the PC's). Format is the first field of every
+/// SRV / UAV / RTV / DSV description. None: no description, or nothing to change.
+unsafe fn pc_view_desc<T>(desc: *const T) -> Option<T> {
+    if desc.is_null() {
+        return None;
+    }
+    let f = *(desc as *const u32);
+    let pc = super::device_x::pc_format(f);
+    if pc == f {
+        return None;
+    }
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| crate::xlog_info!("D3D12.X: views in the console-only format {f} are made in the PC's {pc} (as their resources)"));
+    let mut d: T = std::ptr::read(desc);
+    *(&mut d as *mut T as *mut u32) = pc;
+    Some(d)
+}
+
+/// After a view creation (a void call: the runtime removes the device on a refused view): a
+/// removal right after it is logged with the view's format and the resource.
+unsafe fn note_after_view(what: &str, res: *mut c_void, desc: *const u32) {
+    note_removal_after(|| {
+        let fmt = if desc.is_null() { "none".to_string() } else { format!("{}", *desc) };
+        format!("{what} (view format {fmt}, resource {})", describe_resource(res))
+    });
+}
+
 unsafe extern "system" fn dev_create_rtv(this: *mut c_void, res: *mut c_void, desc: *const c_void, handle: usize) {
     type F = unsafe extern "system" fn(*mut c_void, *mut c_void, *const c_void, usize);
     let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "CreateRenderTargetView")));
-    f(this, res, desc, handle);
+    let pd = pc_view_desc(desc as *const D3D12_RENDER_TARGET_VIEW_DESC);
+    f(this, res, pd.as_ref().map_or(desc, |d| d as *const D3D12_RENDER_TARGET_VIEW_DESC as *const c_void), handle);
+    note_after_view("CreateRenderTargetView", res, desc as *const u32);
     super::present::note_rtv(handle, res);
     if super::present::trace_frame() {
         static N: AtomicU64 = AtomicU64::new(0);
@@ -4473,6 +4537,7 @@ unsafe fn queue_dispatch(slot: usize, this: *mut c_void, a1: usize, a2: usize, a
         14 | 15 if is_fence(a1) => {
             let f: unsafe extern "system" fn(*mut c_void, usize, usize) -> i32 = std::mem::transmute(pc(if older == 14 { PC_SIGNAL } else { PC_WAIT }));
             let hr = f(this, a1, a2);
+            note_removal_after(|| format!("the title's queue {} of fence {a1:#x} to {a2:#x} ({hr:#x})", if older == 14 { "Signal" } else { "Wait" }));
             if older == 14 && hr >= 0 {
                 super::fence_x::note_queue_signal(a1, a2 as u64);
             }
@@ -4560,6 +4625,7 @@ unsafe extern "system" fn q_signal_x(this: *mut c_void, fence: *mut c_void, valu
     const PC_SIGNAL: usize = 14;
     let f: unsafe extern "system" fn(*mut c_void, *mut c_void, u64) -> HRESULT = std::mem::transmute(orig_fn(this, PC_SIGNAL));
     let hr = f(this, fence, value);
+    note_removal_after(|| format!("the title's queue SignalX of fence {fence:p} to {value:#x} ({hr:#x})"));
     if hr >= 0 {
         super::fence_x::note_queue_signal(fence as usize, value);
     }
