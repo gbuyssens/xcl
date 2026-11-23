@@ -335,7 +335,12 @@ amd_fidelityfx_loader_xbox / amd_fidelityfx_upscaler_xbox, XboxBvhBuilder. The g
 - `OutputDebugStringA/W` (kernelx HLE) → XCL log `[debug] …` (console DLLs and games write a lot there; that is how the XDXR error surfaced).
 - **The XboxBvhBuilder constructor goes through completely on the XCL device** (probe `XCL_PROBE_BVH_DEVICE=1`):
   - `XCL_D3D12_TRACE=1` (NEW, `guard::make_tracer`): every public vtable method called from console code → log
-    `D3D12 trace: Iface::Method (#slot) ← module+offset`. That is how the sequence CreateRootSignature → SetName → slot 62 came out.
+    `D3D12 trace: Iface::Method (#slot) ← module+offset: (args…)`. That is how the sequence CreateRootSignature → SetName → slot 62 came out.
+    (The tail-jump form: the slot splits classify by the caller's return address, so the result is not logged.)
+  - `XCL_TRACE_IMPORTS=1` (`guard::make_call_tracer`, `resolver::trace_filter`): every import resolved to an HLE
+    function is wrapped in a call-through thunk → `trace: dll!Function ← module+offset: (args…) → result` (pointer
+    arguments show the string or the words they point at). `all` wraps system imports too (short runs: a data export
+    would be wrapped as well); `kernelx!Create,-kernelx!GetTickCount` include / exclude prefixes of `dll!Function`.
   - **The console device vtable differs from the PC one:** slot 62 on the console = `CreateComputePipelineState(desc, NULL, NULL,
     riid, ppv)` (two extra arguments), on PC = CreateStateObject. `guard::make_split` (NEW): a call from the game image →
     console version, from the runtime → PC; table `real::console_slots` (for now only device #62).
