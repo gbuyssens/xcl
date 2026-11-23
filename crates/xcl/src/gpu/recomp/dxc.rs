@@ -130,6 +130,15 @@ pub fn compile_threads() -> usize {
     })
 }
 
+/// GB of commit `wait_for_memory` keeps free besides the compiles: 6 for a running title (its
+/// own allocations), less without one (`set_memory_reserve`: `xcl shaders --precompile`).
+static RESERVE_GB: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(6);
+
+/// The commit `wait_for_memory` keeps free besides the compiles (no title running: less).
+pub fn set_memory_reserve(gb: u64) {
+    RESERVE_GB.store(gb, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Compiles running on the DXC workers (`wait_for_memory` lets them in).
 static WORKING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
@@ -154,7 +163,7 @@ pub fn wait_for_memory() -> MemorySlot {
     loop {
         let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
         m.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
-        let need = (6u64 << 30) + ((WORKING.load(Ordering::Acquire) as u64) << 30);
+        let need = (RESERVE_GB.load(Ordering::Relaxed) << 30) + ((WORKING.load(Ordering::Acquire) as u64) << 30);
         let plenty = unsafe { GlobalMemoryStatusEx(&mut m) } == 0 || m.ullAvailPageFile >= need;
         if plenty || start.elapsed().as_secs() >= 60 {
             WORKING.fetch_add(1, Ordering::AcqRel);
@@ -208,8 +217,14 @@ fn compile_here(src: &str, entry: &str, profile: &str, extra: &[&str]) -> Result
     // With branch-free emission (select / and / or) it is fast: that shader 0.3 s, a
     // 15 720-instruction one 6 s (585 KB DXIL vs 1.6 MB at -O0, which the driver could not
     // compile). -O0 only as a safety net for enormous sources.
-    if src.len() > 8 * 1024 * 1024 && !extra.iter().any(|a| a.starts_with("-O")) {
-        args.push(crate::util::wide("-O0"));
+    // -O1 from 1 MB on: the same DXIL size at a quarter less time (a retail game's 4.8 MB HLSL of
+    // a 19 600-instruction CS: 13.5 s instead of 17.7 at -O3; -O0 10.6 s, but twice the DXIL)
+    if !extra.iter().any(|a| a.starts_with("-O")) {
+        if src.len() > 8 * 1024 * 1024 {
+            args.push(crate::util::wide("-O0"));
+        } else if src.len() > 1024 * 1024 {
+            args.push(crate::util::wide("-O1"));
+        }
     }
     args.extend(extra.iter().map(|a| crate::util::wide(a)));
     let ptrs: Vec<PCWSTR> = args.iter().map(|a| PCWSTR(a.as_ptr())).collect();
@@ -596,6 +611,16 @@ pub fn cached_only<R>(f: impl FnOnce() -> R) -> (R, bool) {
     let r = f();
     CACHED_ONLY.with(|c| c.set(false));
     (r, MISSED.with(|m| m.replace(false)))
+}
+
+/// Inside `cached_only`: what is being made is deferred as if its DXIL were missing (the
+/// driver's compile of a big program is the slow part then). False outside `cached_only`.
+pub fn defer() -> bool {
+    let inside = CACHED_ONLY.with(|c| c.get());
+    if inside {
+        MISSED.with(|m| m.set(true));
+    }
+    inside
 }
 
 /// Inside `cached_only`.

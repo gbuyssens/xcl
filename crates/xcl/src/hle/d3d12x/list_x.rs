@@ -394,7 +394,28 @@ const PC_OM_SET_STENCIL_REF: usize = 24;
 const PC_OM_SET_RENDER_TARGETS: usize = 46;
 
 /// console #20 IASetPrimitiveTopology (PC #20)
+/// The console's rect list (AMD's DI_PT_RECTLIST, 0x11): three vertices of a rectangle, the
+/// fourth implied. The PC has no such topology; until a geometry shader expands them, each rect
+/// is drawn as the triangle of its three vertices (a retail game's full-screen passes).
+pub(super) const RECT_LIST: u32 = 17;
+
 pub(super) unsafe extern "system" fn ia_set_topology_x(this: *mut c_void, t: u32) {
+    // a topology the PC does not have (console ones): logged once each
+    if !matches!(t, 0..=5 | 10..=13 | 33..=64) {
+        static SEEN: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
+        let new = {
+            let mut g = SEEN.lock().unwrap();
+            let n = !g.contains(&t);
+            if n {
+                g.push(t);
+            }
+            n
+        };
+        if new {
+            crate::xlog_warn!("D3D12.X: IASetPrimitiveTopology({t}) – a console topology the PC does not have{}", if t == RECT_LIST { ": rect lists are drawn as triangle lists (each rect's first half only)" } else { "" });
+        }
+    }
+    let t = if t == RECT_LIST { windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST.0 as u32 } else { t };
     with_bindings(this, |b| b.topology = Some(t));
     pc::<unsafe extern "system" fn(*mut c_void, u32)>(this, PC_IA_SET_PRIMITIVE_TOPOLOGY)(this, t)
 }
@@ -505,6 +526,8 @@ struct ListState {
     sparse_writes: Vec<(usize, usize)>,
     /// External memory waits recorded on this list
     pending_waits: Vec<PendingWait>,
+    /// bottom-of-pipe writes into memory the GPU does not see (`cpu_writes`)
+    cpu_writes: Vec<super::cpu_writes::Write>,
     /// state a PC Reset clears (restored after KickoffX)
     bindings: Bindings,
 }
@@ -856,6 +879,16 @@ pub(super) unsafe fn readback_sparse_writes(queue: *mut c_void, lists: &[*mut c_
     }
 }
 
+/// After `lists` went to `queue`: their writes into memory the GPU does not see (`cpu_writes`).
+pub(super) unsafe fn cpu_writes_after(queue: *mut c_void, lists: &[*mut c_void]) {
+    let writes: Vec<super::cpu_writes::Write> = {
+        let g = LISTS.lock().unwrap();
+        let Some(m) = g.as_ref() else { return };
+        lists.iter().filter_map(|&l| m.get(&(l as usize))).flat_map(|s| s.cpu_writes.iter().cloned()).collect()
+    };
+    super::cpu_writes::after(queue, writes);
+}
+
 /// Submit `lists` through `submit`, splitting the batch before any list whose `Wait32/64BitValueX`
 /// condition is not yet satisfied so earlier lists in the same batch can run on the GPU first.
 pub(super) unsafe fn execute_with_waits(lists: &[*mut c_void], mut submit: impl FnMut(&[*mut c_void])) {
@@ -1022,6 +1055,13 @@ unsafe fn write(list: *mut c_void, va: u64, words: &[u32], mode: D3D12_WRITEBUFF
         return warn(&N, what, format_args!("{va:#x} is not {n}-byte aligned"));
     }
     let (Some((d, _)), Some(at)) = (real::uma_window_buffer(va as usize, n as usize), real::uma_va_of(va as usize)) else {
+        // the title's own memory: written by the CPU once the GPU is there
+        if super::cpu_writes::writable(va as usize, n as usize) {
+            if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&(list as usize))) {
+                s.cpu_writes.push((va as usize, words.to_vec()));
+                return;
+            }
+        }
         return warn(&N, what, format_args!("{va:#x} is not in unified memory"));
     };
     note_write(list as usize, va, n);
@@ -1094,8 +1134,9 @@ unsafe fn wait_memory(list: *mut c_void, va: u64, width: u8, comparison: u32, va
     if !va.is_multiple_of(n) {
         return warn(&N, what, format_args!("{va:#x} is not {n}-byte aligned"));
     }
-    if real::uma_window_buffer(va as usize, width as usize).is_none() {
-        return warn(&N, what, format_args!("{va:#x} is not in unified memory"));
+    // (the wait reads the memory on the CPU: the title's own memory too, which `cpu_writes` fills)
+    if real::uma_window_buffer(va as usize, width as usize).is_none() && !crate::gpu::shader::readable(va as usize, width as usize) {
+        return warn(&N, what, format_args!("{va:#x} is not readable memory"));
     }
     if compare_u64(comparison, 0, 0).is_none() {
         return warn(&N, what, format_args!("unknown comparison op {comparison}"));
@@ -1236,8 +1277,10 @@ pub(super) unsafe extern "system" fn kickoff_x(this: *mut c_void) {
         };
         let sparse_writes = s.clear_sparse_writes();
         s.written_ranges.clear();
-        (s.allocator, q, s.bound_pso, s.depth_bias, s.index_buffer, s.depth_bounds, active_query, waits, sparse_writes)
+        let cpu_writes = std::mem::take(&mut s.cpu_writes);
+        (s.allocator, q, s.bound_pso, s.depth_bias, s.index_buffer, s.depth_bounds, active_query, waits, (sparse_writes, cpu_writes))
     };
+    let (sparse_writes, cpu_writes) = sparse_writes;
 
     // End any active occlusion query before Close (PC forbids closing with an open query).
     if let Some(((h, i), qty)) = active_query {
@@ -1266,6 +1309,7 @@ pub(super) unsafe extern "system" fn kickoff_x(this: *mut c_void) {
             super::sparse::readback_after_execute(q, &sparse_writes);
         }
     }
+    super::cpu_writes::after(q_raw, cpu_writes);
 
     let ext_closed = *(this as *const usize);
     let init_pso = super::pso_async::resolve_for_bind(bound_pso);
@@ -1653,6 +1697,7 @@ pub(super) unsafe extern "system" fn reset_x(this: *mut c_void, alloc: usize, ps
         s.written_ranges.clear();
         s.clear_sparse_writes();
         s.clear_waits();
+        s.cpu_writes.clear();
         s.bindings = Bindings::default();
         s.list_type == Some(D3D12_COMMAND_LIST_TYPE_BUNDLE)
     };

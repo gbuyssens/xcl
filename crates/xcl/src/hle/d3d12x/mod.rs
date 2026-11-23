@@ -14,6 +14,7 @@ pub mod console_heap;
 pub mod console_list;
 pub mod device_x;
 pub mod dxgi_device;
+mod cpu_writes;
 mod fence_x;
 pub mod frame;
 pub mod guard;

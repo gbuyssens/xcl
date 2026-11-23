@@ -713,7 +713,9 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
         }
     };
     if args.iter().any(|a| a == "--precompile") {
-        return precompile(&input, opt("--limit").unwrap_or(usize::MAX), opt("--windows").unwrap_or(4) as u32, opt("--split").map(|v| v != 0), t0);
+        let only = args.iter().position(|a| a == "--only").and_then(|i| args.get(i + 1)).map(|s| s.to_ascii_lowercase());
+        let pipelines = args.iter().any(|a| a == "--pipelines");
+        return precompile(&input, opt("--limit").unwrap_or(usize::MAX), opt("--windows").unwrap_or(4) as u32, opt("--split").map(|v| v != 0), only.as_deref(), pipelines, t0);
     }
     let agg = analyze(&input, recomp_on, compile, iface_on);
     drop(input);
@@ -731,13 +733,105 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
 /// no split form, so a title asked for other HLSL and compiled everything again. Still
 /// different at run time: a PS's static samplers after its VS's (sampler base 0 here) and the
 /// mesh pass-through, which the runtime builds for its pixel shader.
-fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, t0: std::time::Instant) -> i32 {
+/// `--pipelines`: each compute program's pipeline made on the GPU as a title's would be (XCL's
+/// ABI root signature with its static samplers): the driver keeps what it compiled in its own
+/// cache, which the title then finds – a retail game's 1 MB-DXIL programs kept its loading
+/// waiting for the driver's compiler for minutes. Nothing runs on the GPU.
+struct Pipelines {
+    dev: windows::Win32::Graphics::Direct3D12::ID3D12Device,
+    signatures: Mutex<std::collections::HashMap<Vec<u32>, windows::Win32::Graphics::Direct3D12::ID3D12RootSignature>>,
+    made: AtomicUsize,
+    refused: AtomicUsize,
+    /// driver compiles running and the most at once (`XCL_PIPELINE_THREADS`, 4): each of the
+    /// biggest takes ~1.5 GB in the driver – fifteen at once took 24 GB
+    running: (Mutex<usize>, std::sync::Condvar),
+    most: usize,
+}
+
+// D3D12 devices and root signatures are free-threaded
+unsafe impl Sync for Pipelines {}
+
+impl Pipelines {
+    fn new() -> Result<Pipelines, String> {
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
+        use windows::Win32::Graphics::Dxgi::*;
+        unsafe {
+            let factory: IDXGIFactory6 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).map_err(|e| e.to_string())?;
+            let sel = crate::gpu::adapter::Selector::from_env_or("auto");
+            let (adapter, _) = crate::gpu::adapter::candidates(&factory, &sel).into_iter().next().ok_or_else(|| crate::gpu::adapter::no_match(&factory, &sel))?;
+            let dev = crate::gpu::agility::create_device(&adapter, D3D_FEATURE_LEVEL_12_0).map_err(|e| e.to_string())?;
+            let most = std::env::var("XCL_PIPELINE_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(4usize).max(1);
+            Ok(Pipelines { dev, signatures: Mutex::new(Default::default()), made: AtomicUsize::new(0), refused: AtomicUsize::new(0), running: (Mutex::new(0), std::sync::Condvar::new()), most })
+        }
+    }
+
+    /// The compute pipeline of `c` (made and released).
+    fn make(&self, c: &recomp::pso::Compiled) {
+        use windows::Win32::Graphics::Direct3D12::*;
+        let key: Vec<u32> = c.samplers.iter().flat_map(|(w, cmp)| w.iter().copied().chain([*cmp as u32])).collect();
+        let rs = {
+            let mut g = self.signatures.lock().unwrap();
+            match g.get(&key) {
+                Some(rs) => rs.clone(),
+                None => match recomp::pso::abi_root_signature_with(&self.dev, true, &c.samplers) {
+                    Ok(rs) => {
+                        g.insert(key, rs.clone());
+                        rs
+                    }
+                    Err(_) => {
+                        self.refused.fetch_add(1, Ordering::Relaxed);
+                        return;
+                    }
+                },
+            }
+        };
+        let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
+            pRootSignature: std::mem::ManuallyDrop::new(Some(rs)),
+            CS: D3D12_SHADER_BYTECODE { pShaderBytecode: c.dxil.as_ptr() as *const _, BytecodeLength: c.dxil.len() },
+            ..Default::default()
+        };
+        {
+            let mut n = self.running.0.lock().unwrap();
+            while *n >= self.most {
+                n = self.running.1.wait(n).unwrap();
+            }
+            *n += 1;
+        }
+        let r: windows::core::Result<ID3D12PipelineState> = unsafe { self.dev.CreateComputePipelineState(&desc) };
+        *self.running.0.lock().unwrap() -= 1;
+        self.running.1.notify_one();
+        drop(std::mem::ManuallyDrop::into_inner(desc.pRootSignature));
+        let done = match r {
+            Ok(_) => self.made.fetch_add(1, Ordering::Relaxed) + 1,
+            Err(_) => self.refused.fetch_add(1, Ordering::Relaxed) + 1,
+        };
+        if done % 25 == 0 {
+            eprintln!("  pipelines: {} made, {} refused", self.made.load(Ordering::Relaxed), self.refused.load(Ordering::Relaxed));
+        }
+    }
+}
+
+fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, only: Option<&str>, pipelines: bool, t0: std::time::Instant) -> i32 {
+    let pipelines = if pipelines {
+        match Pipelines::new() {
+            Ok(p) => Some(p),
+            Err(e) => {
+                eprintln!("xcl shaders --pipelines: no GPU device: {e}");
+                return 2;
+            }
+        }
+    } else {
+        None
+    };
+    let pipelines = pipelines.as_ref();
     let n = input.len().min(limit);
     let next = AtomicUsize::new(0);
     let (done, compiled, cached, failed, skipped) = (AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0));
     let errors: Mutex<Vec<String>> = Mutex::new(Vec::new());
     // the compiles run on the DXC pool; these threads translate and keep it fed
     let threads = recomp::dxc::compile_threads() + 2;
+    // no title runs: only a little commit is kept free besides the compiles
+    recomp::dxc::set_memory_reserve(2);
     let split = split.unwrap_or_else(|| recomp::pso::split_wave64_forced() || recomp::runner::wave64_supported().is_ok_and(|w| !w));
     println!(
         "precompiling {n} shaders into {} ({} compile threads; {windows} memory windows{})",
@@ -755,6 +849,34 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, t0
                 let (name, blob) = input.get(i);
                 let Some(blob) = blob else { continue };
                 let Some(sh) = xbox::parse(&blob) else { continue };
+                if only.is_some_and(|o| !sh.stage.eq_ignore_ascii_case(o)) {
+                    done.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+                // a compute program as a title's pipeline translates it (`pso::console_to_dxil_in`):
+                // into the translation cache too, so the title does not translate it again
+                if sh.fssm.iter().any(|f| matches!(recomp::interface(&blob, &sh, f), Some(recomp::Mode::Compute(_)))) {
+                    match recomp::pso::console_to_dxil_in(&blob, recomp::pso::Stage::Compute, 0, split, windows) {
+                        Ok(c) => {
+                            if let Some(p) = pipelines {
+                                p.make(&c);
+                            }
+                            compiled.fetch_add(1, Ordering::Relaxed)
+                        }
+                        Err(e) => {
+                            let mut g = errors.lock().unwrap();
+                            if g.len() < 10 {
+                                g.push(format!("{name}: {}", e.lines().find(|l| l.contains("error")).unwrap_or(e.lines().next().unwrap_or(""))));
+                            }
+                            failed.fetch_add(1, Ordering::Relaxed)
+                        }
+                    };
+                    let d = done.fetch_add(1, Ordering::Relaxed) + 1;
+                    if d % 200 == 0 {
+                        eprintln!("  {d}/{n} ({:.0} s)", t0.elapsed().as_secs_f64());
+                    }
+                    continue;
+                }
                 for f in &sh.fssm {
                     let Some(mode) = recomp::interface(&blob, &sh, f) else { continue };
                     let jobs: Vec<(&str, Option<String>)> = match &mode {
@@ -806,6 +928,9 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, t0
         skipped.into_inner(),
         t0.elapsed().as_secs_f64()
     );
+    if let Some(p) = pipelines {
+        println!("pipelines made on the GPU {}, refused {}", p.made.load(Ordering::Relaxed), p.refused.load(Ordering::Relaxed));
+    }
     for e in errors.into_inner().unwrap() {
         println!("  {e}");
     }

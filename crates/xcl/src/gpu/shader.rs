@@ -252,6 +252,14 @@ pub fn capture(stage: &str, ptr: usize, len: usize) {
         *st.stats.unknown_parts.entry(p.fourcc.clone()).or_default() += 1;
     }
     drop(g);
+    if !dumps_enabled() {
+        let names: Vec<&str> = parts.iter().map(|p| p.fourcc.as_str()).collect();
+        crate::xlog_info!("[SHADER] {stage} {h:016x}: {} B, format {}, parts [{}]", blob.len(), kind.label(), names.join(","));
+        if kind == Kind::XboxNative {
+            account_xbox(&blob, h);
+        }
+        return;
+    }
     let dir = dump_dir();
     let _ = std::fs::create_dir_all(&dir);
     let base = dir.join(format!("{h:016x}_{stage}"));
@@ -266,6 +274,34 @@ pub fn capture(stage: &str, ptr: usize, len: usize) {
             let _ = std::fs::write(base.with_extension("rdna2.txt"), listing);
             crate::xlog_info!("[SHADER] {h:016x}: RDNA2 code found – disassembly in {}", base.with_extension("rdna2.txt").display());
         }
+    }
+}
+
+/// `XCL_DUMP_SHADERS=1`: every shader the title submits is written to the title's `shaders`
+/// folder – the blob, a console program's FSSMs, its disassembly and its HLSL (translated once
+/// more for that: the report's `recomp_*` counts come from it). Off by default: a retail game's
+/// ~17 000 dumps took 4.8 GB, and translating each again took its loading threads ~0.1 s a
+/// program at every start.
+fn dumps_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XCL_DUMP_SHADERS").is_ok_and(|v| v == "1"))
+}
+
+/// Console container without dumps: its FSSM variants and instructions accounted.
+fn account_xbox(blob: &[u8], h: u64) {
+    let Some(sh) = xbox::parse(blob) else { return };
+    let mut insts = xbox::InstStats::default();
+    insts.add_shader(&sh);
+    let failed = !sh.notes.is_empty() || sh.fssm.iter().any(|f| f.error.is_some() || f.programs.is_empty());
+    if let Some(st) = STATE.lock().unwrap().as_mut() {
+        for f in &sh.fssm {
+            *st.stats.xbox_hw_stages.entry(f.stage_label()).or_default() += 1;
+        }
+        st.stats.xbox_errors += failed as usize;
+        st.insts.merge(&insts);
+    }
+    if failed {
+        crate::xlog_info!("[SHADER] {h:016x}: console container {} – WARNING: incomplete parse (xcl disasm)", sh.stage);
     }
 }
 

@@ -12,6 +12,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock};
 
 struct Pending {
+    /// the build, until a worker – or a bind that cannot wait for the queue – takes it
+    job: Mutex<Option<Job>>,
     /// the real pipeline state (raw pointer), 0 while building or when building failed
     real: AtomicUsize,
     done: Mutex<bool>,
@@ -23,6 +25,29 @@ struct Pending {
 
 /// stand-in handed to the title → its real pipeline
 static PENDING: Mutex<Option<HashMap<usize, Arc<Pending>>>> = Mutex::new(None);
+
+/// The build is done (`real`: its pipeline, 0 = failed).
+fn complete(p: &Pending, real: usize) {
+    if real == 0 {
+        FAILED.fetch_add(1, Ordering::Relaxed);
+    } else {
+        BUILT.fetch_add(1, Ordering::Relaxed);
+    }
+    let orphan = {
+        let mut done = p.done.lock().unwrap();
+        let orphan = p.orphan.load(Ordering::Acquire);
+        if !orphan {
+            p.real.store(real, Ordering::Release);
+        }
+        *done = true;
+        p.cv.notify_all();
+        orphan
+    };
+    // outside `done`: the Release override takes PENDING (`counts` takes PENDING, then `done`)
+    if orphan {
+        release(real);
+    }
+}
 static BUILT: AtomicUsize = AtomicUsize::new(0);
 static FAILED: AtomicUsize = AtomicUsize::new(0);
 
@@ -33,10 +58,10 @@ pub fn enabled() -> bool {
 /// Builds the real pipeline: its raw pointer, 0 = failed.
 pub type Job = Box<dyn FnOnce() -> usize + Send>;
 
-fn queue() -> &'static Mutex<mpsc::Sender<(Arc<Pending>, Job)>> {
-    static Q: OnceLock<Mutex<mpsc::Sender<(Arc<Pending>, Job)>>> = OnceLock::new();
+fn queue() -> &'static Mutex<mpsc::Sender<Arc<Pending>>> {
+    static Q: OnceLock<Mutex<mpsc::Sender<Arc<Pending>>>> = OnceLock::new();
     Q.get_or_init(|| {
-        let (tx, rx) = mpsc::channel::<(Arc<Pending>, Job)>();
+        let (tx, rx) = mpsc::channel::<Arc<Pending>>();
         let rx = Arc::new(Mutex::new(rx));
         // translation recurses deeply on big programs; DXC itself runs on its own pool
         let n = crate::gpu::recomp::dxc::compile_threads();
@@ -44,26 +69,11 @@ fn queue() -> &'static Mutex<mpsc::Sender<(Arc<Pending>, Job)>> {
             let rx = rx.clone();
             let _ = std::thread::Builder::new().name(format!("xcl-pso-{k}")).stack_size(64 << 20).spawn(move || loop {
                 let next = rx.lock().unwrap().recv();
-                let Ok((p, job)) = next else { return };
-                let real = job();
-                if real == 0 {
-                    FAILED.fetch_add(1, Ordering::Relaxed);
-                } else {
-                    BUILT.fetch_add(1, Ordering::Relaxed);
-                }
-                let orphan = {
-                    let mut done = p.done.lock().unwrap();
-                    let orphan = p.orphan.load(Ordering::Acquire);
-                    if !orphan {
-                        p.real.store(real, Ordering::Release);
-                    }
-                    *done = true;
-                    p.cv.notify_all();
-                    orphan
-                };
-                // outside `done`: the Release override takes PENDING (`counts` takes PENDING, then `done`)
-                if orphan {
-                    release(real);
+                let Ok(p) = next else { return };
+                // (None: a bind took it and builds it itself)
+                let job = p.job.lock().unwrap().take();
+                if let Some(job) = job {
+                    complete(&p, job());
                 }
             });
         }
@@ -80,13 +90,13 @@ pub fn release(p: usize) {
 
 /// `standin` went to the title; `job` builds the real pipeline on a worker.
 pub fn submit(standin: usize, compute: bool, job: Job) {
-    let p = Arc::new(Pending { real: AtomicUsize::new(0), done: Mutex::new(false), cv: Condvar::new(), compute, orphan: Default::default() });
+    let p = Arc::new(Pending { job: Mutex::new(Some(job)), real: AtomicUsize::new(0), done: Mutex::new(false), cv: Condvar::new(), compute, orphan: Default::default() });
     PENDING.lock().unwrap().get_or_insert_with(HashMap::new).insert(standin, p.clone());
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
         crate::xlog_info!("D3D12.X: pipelines whose shaders are not compiled yet get a stand-in and are built in the background");
     });
-    let _ = queue().lock().unwrap().send((p, job));
+    let _ = queue().lock().unwrap().send(p);
 }
 
 fn entry(pso: usize) -> Option<Arc<Pending>> {
@@ -101,9 +111,14 @@ pub fn resolve(pso: usize) -> usize {
     }
 }
 
-/// `resolve`, waiting for a pipeline still being built.
+/// `resolve`, waiting for a pipeline still being built – built here if no worker has started
+/// it yet (a queue of a title's hundreds of pipelines must not hold up the one it binds now).
 pub fn resolve_wait(pso: usize) -> usize {
     let Some(p) = entry(pso) else { return pso };
+    let job = p.job.lock().unwrap().take();
+    if let Some(job) = job {
+        complete(&p, job());
+    }
     let mut done = p.done.lock().unwrap();
     while !*done {
         done = p.cv.wait(done).unwrap();

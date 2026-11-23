@@ -228,6 +228,7 @@ unsafe fn note_signaled(block: *const u8, index: i32) {
 
 /// device #79 ScheduleFrameEventX(type, offset µs, ancillary, flags)
 pub unsafe extern "system" fn schedule_frame_event_x(_this: *mut std::ffi::c_void, ty: u32, offset_us: u32, block: *const u8, flags: u32) -> HRESULT {
+    trace_calls(format_args!("ScheduleFrameEventX(type {ty}, offset {offset_us} µs, block {block:p}, flags {flags:#x})"));
     let unschedule = flags & UNSCHEDULE != 0;
     let invalid = with(|c| c.interval_us == 0 || ty as usize >= TYPES || (!c.active && ty != 0) || (unschedule && (ty == 0 || !c.kinds[0].scheduled)));
     if invalid {
@@ -286,7 +287,17 @@ pub fn activity() -> [u64; 4] {
 }
 
 /// device #80 WaitFrameEventX(type, timeout ms, ancillary, flags, token in/out)
+/// `XCL_TRACE_FRAME_EVENTS`: the title's frame-event calls (the first 40)
+fn trace_calls(what: std::fmt::Arguments) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    static N: AtomicU64 = AtomicU64::new(0);
+    if *ON.get_or_init(|| std::env::var_os("XCL_TRACE_FRAME_EVENTS").is_some()) && N.fetch_add(1, Ordering::Relaxed) < 40 {
+        crate::xlog_info!("frame events: {what}");
+    }
+}
+
 pub unsafe extern "system" fn wait_frame_event_x(_this: *mut std::ffi::c_void, ty: u32, timeout_ms: u32, block: *const u8, flags: u32, token: *mut u64) -> HRESULT {
+    trace_calls(format_args!("WaitFrameEventX(type {ty}, timeout {timeout_ms} ms, block {block:p}, flags {flags:#x}, token in {:#x})", if token.is_null() { 0 } else { *token }));
     let internal = with(|c| ((ty as usize) < TYPES && c.kinds[ty as usize].scheduled).then(|| c.kinds[ty as usize].internal as usize));
     let Some(internal) = internal else { return E_INVALIDARG };
     let token_in = if token.is_null() { 0 } else { *token };
@@ -411,14 +422,18 @@ fn clock_thread() {
         }
         let mut last = [i64::MIN / 2; TYPES];
         loop {
-            // the next event of the current schedule
+            // the next events of the current schedule: every type due at the earliest deadline
+            // (types at the same point of the frame fire together – a retail game schedules the
+            // origin and type 2 both at offset 0 and waits on type 2; picking one, the origin
+            // always won and type 2 never came)
             let plan = with(|c| {
                 if !c.active || c.interval_us == 0 {
                     return None;
                 }
                 let interval = ticks(c.interval_us as i64);
                 let now = qpc();
-                c.kinds
+                let due: Vec<(i64, usize, usize, Arc<Handles>)> = c
+                    .kinds
                     .iter()
                     .enumerate()
                     .filter(|(_, k)| k.scheduled)
@@ -429,34 +444,37 @@ fn clock_thread() {
                         }
                         (d, i, k.internal as usize, Arc::clone(&k.extra))
                     })
-                    .min_by_key(|e| e.0)
-                    .map(|e| (c.generation, e))
+                    .collect();
+                let first = due.iter().map(|e| e.0).min()?;
+                Some((c.generation, first, due.into_iter().filter(|e| e.0 == first).collect::<Vec<_>>()))
             });
-            let Some((generation, (deadline, ty, internal, extra))) = plan else {
+            let Some((generation, deadline, due)) = plan else {
                 WaitForMultipleObjects(1, &wake(), 0, INFINITE);
                 continue;
             };
             if !sleep_until(timer, deadline) || !with(|c| c.generation == generation) {
                 continue;
             }
-            last[ty] = deadline;
-            if ty == 0 {
-                let now = qpc();
-                LAST_ORIGIN.store(now, Ordering::Relaxed);
-                // an origin the semaphore cannot hold (ORIGIN_SEMAPHORE_MAX pending) is lost to the title too
-                if ReleaseSemaphore(internal as HANDLE, 1, std::ptr::null_mut()) != 0 {
-                    let mut o = ORIGINS.lock().unwrap();
-                    o.push_back(now);
-                    while o.len() > ORIGIN_SEMAPHORE_MAX as usize {
-                        o.pop_front();
+            for (_, ty, internal, extra) in due {
+                last[ty] = deadline;
+                if ty == 0 {
+                    let now = qpc();
+                    LAST_ORIGIN.store(now, Ordering::Relaxed);
+                    // an origin the semaphore cannot hold (ORIGIN_SEMAPHORE_MAX pending) is lost to the title too
+                    if ReleaseSemaphore(internal as HANDLE, 1, std::ptr::null_mut()) != 0 {
+                        let mut o = ORIGINS.lock().unwrap();
+                        o.push_back(now);
+                        while o.len() > ORIGIN_SEMAPHORE_MAX as usize {
+                            o.pop_front();
+                        }
                     }
+                } else {
+                    SetEvent(internal as HANDLE);
                 }
-            } else {
-                SetEvent(internal as HANDLE);
-            }
-            for &h in &extra.0 {
-                if SetEvent(h) == 0 {
-                    ReleaseSemaphore(h, 1, std::ptr::null_mut());
+                for &h in &extra.0 {
+                    if SetEvent(h) == 0 {
+                        ReleaseSemaphore(h, 1, std::ptr::null_mut());
+                    }
                 }
             }
         }

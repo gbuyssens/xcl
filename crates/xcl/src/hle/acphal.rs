@@ -14,8 +14,11 @@
 //! `AcpHalCreate(&hal)` – an object whose vtable is Connect(commands, messages), Disconnect,
 //! SubmitCommand(type, id, frame, data, size), PopMessage(&message) -> bool,
 //! GetNumMessages, Release; messages {u32 type, u32, u64 value, u64 id}: 2 audio frame,
-//! 0x10 command done (id), 0x80 disconnected. `chad.dll` (XDsp) is left to the stub database:
-//! E_NOTIMPL, the processor's DSP is not there.
+//! 0x10 command done (id), 0x80 disconnected. `chad.dll` (XDsp, the processor's DSP) connects
+//! and takes commands that do nothing: a retail game stops at a breakpoint when it cannot connect
+//! (XDefiant took E_NOTIMPL, the stub database's answer before).
+//! `XDspConnectWithMaximumStreamLimit(a, b, c, max streams, flags, &handle)`,
+//! `XDspActivate(handle, …)`, `XDspSubmitCommand(handle, …)`, `XDspDeactivate`, `XDspDisconnect`.
 
 #![allow(non_snake_case)]
 
@@ -718,61 +721,54 @@ pub unsafe extern "system" fn XApuGetUtilization(_a: u32, _b: u32, u: *mut u32) 
 }
 
 // ---------------------------------------------------------------------------------------
-// chad.dll – the console's audio DSP offload (XDsp*). A retail game connects to it right
-// after the decoder and asserts on anything but S_OK. Its signatures are not published: the
-// first call of each function is logged with its arguments, every call is acknowledged and
-// nothing runs (as for the SHAPE contexts and the decoder).
+// the DSP (chad.dll): connected, with nothing to run
 // ---------------------------------------------------------------------------------------
 
-/// The first call of an XDsp function: its arguments, with what pointer arguments point at.
-fn xdsp_note(what: &'static str, args: [usize; 4]) {
-    static SEEN: Mutex<Vec<&'static str>> = Mutex::new(Vec::new());
-    let Ok(mut seen) = SEEN.lock() else { return };
-    if seen.contains(&what) {
-        return;
+/// a DSP connection (what the handle points at)
+struct XDsp {
+    streams: u32,
+}
+
+/// XDspConnectWithMaximumStreamLimit(a, b, c, max streams, flags, &handle)
+pub unsafe extern "system" fn XDspConnectWithMaximumStreamLimit(_a: usize, _b: u32, _c: u32, streams: u32, _flags: u32, handle: *mut *mut c_void) -> HRESULT {
+    if handle.is_null() {
+        return E_INVALIDARG;
     }
-    seen.push(what);
-    let show = |a: usize| -> String {
-        if a > 0x10000 && crate::gpu::shader::readable(a, 32) {
-            let w: Vec<String> = (0..4).map(|k| format!("{:#x}", unsafe { (a as *const u64).add(k).read_unaligned() })).collect();
-            format!("{a:#x} -> [{}]", w.join(", "))
-        } else {
-            format!("{a:#x}")
-        }
-    };
-    crate::xlog_info!("chad: {what}({}, {}, {}, {}) – acknowledged, nothing runs", show(args[0]), show(args[1]), show(args[2]), show(args[3]));
+    *handle = Box::into_raw(Box::new(XDsp { streams })) as *mut c_void;
+    crate::xlog_info!("acphal: DSP connected ({streams} streams) – its commands are taken, nothing runs");
+    S_OK
 }
 
-/// A fake DSP connection handle (non-null, never dereferenced by XCL).
-const XDSP_HANDLE: usize = 0x5D5B_0001;
-
-/// `XDspConnectWithMaximumStreamLimit(…)`: the last pointer argument is taken as the out
-/// handle and gets a non-null one.
-pub unsafe extern "system" fn XDspConnectWithMaximumStreamLimit(a: usize, b: usize, c: usize, d: usize) -> HRESULT {
-    xdsp_note("XDspConnectWithMaximumStreamLimit", [a, b, c, d]);
-    if let Some(out) = [d, c, b, a].into_iter().find(|&p| p > 0x10000 && p % 8 == 0 && crate::gpu::shader::readable(p, 8)) {
-        (out as *mut usize).write(XDSP_HANDLE);
+pub unsafe extern "system" fn XDspDisconnect(handle: *mut c_void) -> HRESULT {
+    if handle.is_null() {
+        return E_INVALIDARG;
     }
+    drop(Box::from_raw(handle as *mut XDsp));
     S_OK
 }
 
-pub unsafe extern "system" fn XDspDisconnect(a: usize, b: usize, c: usize, d: usize) -> HRESULT {
-    xdsp_note("XDspDisconnect", [a, b, c, d]);
-    S_OK
+pub unsafe extern "system" fn XDspActivate(handle: *mut c_void, _a: usize, _b: usize, _c: usize) -> HRESULT {
+    if handle.is_null() {
+        E_INVALIDARG
+    } else {
+        S_OK
+    }
 }
 
-pub unsafe extern "system" fn XDspActivate(a: usize, b: usize, c: usize, d: usize) -> HRESULT {
-    xdsp_note("XDspActivate", [a, b, c, d]);
-    S_OK
+pub unsafe extern "system" fn XDspDeactivate(handle: *mut c_void, _a: usize, _b: usize, _c: usize) -> HRESULT {
+    if handle.is_null() {
+        E_INVALIDARG
+    } else {
+        S_OK
+    }
 }
 
-pub unsafe extern "system" fn XDspDeactivate(a: usize, b: usize, c: usize, d: usize) -> HRESULT {
-    xdsp_note("XDspDeactivate", [a, b, c, d]);
-    S_OK
-}
-
-pub unsafe extern "system" fn XDspSubmitCommand(a: usize, b: usize, c: usize, d: usize) -> HRESULT {
-    xdsp_note("XDspSubmitCommand", [a, b, c, d]);
+pub unsafe extern "system" fn XDspSubmitCommand(handle: *mut c_void, _a: usize, _b: usize, _c: usize) -> HRESULT {
+    static FIRST: std::sync::Once = std::sync::Once::new();
+    if handle.is_null() {
+        return E_INVALIDARG;
+    }
+    FIRST.call_once(|| crate::xlog_info!("acphal: first DSP command ({} streams) – taken, not run", (*(handle as *const XDsp)).streams));
     S_OK
 }
 
@@ -805,6 +801,20 @@ pub fn exports() -> Vec<(&'static str, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_dsp_connects_and_takes_commands() {
+        unsafe {
+            let mut h = std::ptr::null_mut();
+            assert_eq!(XDspConnectWithMaximumStreamLimit(0, 0, 0, 0x80, 1, &mut h), S_OK);
+            assert!(!h.is_null());
+            assert_eq!(XDspActivate(h, 0, 0, 0), S_OK);
+            assert_eq!(XDspSubmitCommand(h, 1, 2, 3), S_OK);
+            assert_eq!(XDspDeactivate(h, 0, 0, 0), S_OK);
+            assert_eq!(XDspDisconnect(h), S_OK);
+            assert_eq!(XDspSubmitCommand(std::ptr::null_mut(), 0, 0, 0), E_INVALIDARG);
+        }
+    }
 
     #[test]
     fn apu_memory_maps_both_ways() {

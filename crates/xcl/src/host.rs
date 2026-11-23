@@ -70,7 +70,8 @@ pub fn host_main(boot_path: &Path) -> i32 {
     if let Some(secs) = std::env::var("XCL_RUN_SECONDS").ok().and_then(|v| v.parse::<u64>().ok()) {
         std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_secs(secs));
-            crate::xlog_info!("XCL_RUN_SECONDS: {secs} s – ending the title");
+            let (shown, presented) = crate::hle::d3d12x::present::counters();
+            crate::xlog_info!("XCL_RUN_SECONDS: {secs} s – ending the title ({shown} frames shown, {presented} PresentX calls)");
             crate::report::write_final(None);
             crate::log::flush();
             crate::hle::d3d12x::real::end_title(0);

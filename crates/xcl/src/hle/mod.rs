@@ -89,7 +89,8 @@ pub const XG: &str = "xg_xs.dll";
 pub const XCRDAPI: &str = "xcrdapi.dll";
 /// the console's user32 subset (windows, the message loop): the PC user32
 pub const MINUSERX: &str = "minuserx.dll";
-/// the console's audio processor (APU memory, its channel, SHAPE contexts) and decoder (xapu)
+/// the console's audio processor (APU memory, its channel, SHAPE contexts), decoder (xapu) and
+/// DSP (chad)
 pub const ACPHAL: &str = "acphal.dll";
 /// controllers (`GameInputCreate`)
 pub const GAMEINPUT: &str = "gameinput.dll";
