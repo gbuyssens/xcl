@@ -1228,6 +1228,11 @@ the FSR4 GPU probe, Unicorn Overlord and XDefiant:
   SGPRs from the root arguments, `res` = a record buffer of groups · `record.record_dwords()` dwords, `mem` = UMA), a UAV barrier,
   then the mesh PSO with `DispatchMesh(groups · mesh_groups_per_record)`; for GS additionally fetching the ES vertices into `mem`
   (IO_GS_PRIMS / IO_GS_VERTICES as in `retail_es_gs_voxelize_geometry_mode`). D3D12.X draw records – from the exe.
+- **Until drawing exists, two-pass pipelines are off by default** (`XCL_TWO_PASS=1` builds them; `gpu_pso_e2e` sets it).
+  Built and handed to the title, the mesh pipeline was bound with the title's root signature and drawn with its
+  DispatchMesh / Draw*: the runtime refused the list and removed the device (DXGI_ERROR_INVALID_CALL, NVIDIA, ~50 s in).
+  Console MS / GS / AS pipelines – and any of them XCL fails to build – now get a stand-in that draws nothing instead of
+  E_INVALIDARG: twice a write to address 0 by the title followed failed pipelines.
 
 ## Shader pack: every record, every program (2026-11-22, issues #34 / #36)
 - **`pack::scan` missed 2 634 of the 26 503 records of `shaders.rpf`**: 2 689 compute shaders have effect-qualified

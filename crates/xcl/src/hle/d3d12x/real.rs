@@ -2954,6 +2954,9 @@ unsafe fn translated_graphics_pso(this: *mut c_void, f: PsoFn, desc: *const c_vo
     }
     if let Some(gs) = shader_bytes(&d.GS).filter(|g| is_console(g)) {
         let _ = f;
+        if !two_pass_enabled() {
+            return Some(E_INVALIDARG);
+        }
         return Some(translated_gs_pso(this, d, vs, gs, riid, ppv));
     }
     // a GPU with 32-lane waves runs a wave64 VS / PS in waves of 32: the lanes 32..63 it
@@ -3209,6 +3212,32 @@ unsafe fn standin_stream(this: *mut c_void, f: PsoFn, desc: *const c_void, riid:
     finish_pso(this, f, new_desc.as_ptr() as *const c_void, riid, ppv)
 }
 
+/// The result of a console graphics pipeline (VS + GS): a failure becomes a stand-in.
+unsafe fn graphics_or_standin(this: *mut c_void, f: PsoFn, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void, hr: HRESULT) -> HRESULT {
+    if hr >= 0 || ppv.is_null() || device_removed_now() {
+        return hr;
+    }
+    let h2 = standin_graphics(this, f, desc, riid, ppv);
+    if h2 < 0 {
+        return hr;
+    }
+    note_standin_for_untranslated("graphics pipeline with a console GS", hr);
+    h2
+}
+
+/// The result of a console mesh pipeline stream: a failure becomes a stand-in.
+unsafe fn stream_or_standin(this: *mut c_void, f: PsoFn, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void, hr: HRESULT) -> HRESULT {
+    if hr >= 0 || ppv.is_null() || device_removed_now() {
+        return hr;
+    }
+    let h2 = standin_stream(this, f, desc, riid, ppv);
+    if h2 < 0 {
+        return hr;
+    }
+    note_standin_for_untranslated("mesh pipeline from a console MS", hr);
+    h2
+}
+
 /// Hand the title `standin`'s result now and build the real pipeline with `build` on a worker.
 unsafe fn go_background(
     this: *mut c_void,
@@ -3316,10 +3345,10 @@ pub(super) unsafe extern "system" fn dev_create_graphics_pso(this: *mut c_void, 
         }
         // no stand-in: the title waits in this call – its compiles go first
         if let Some(hr) = crate::gpu::recomp::dxc::urgent(|| translated_graphics_pso(this, f, desc, riid, ppv)) {
-            return hr;
+            return graphics_or_standin(this, f, desc, riid, ppv, hr);
         }
     } else if let Some(hr) = translated {
-        return hr;
+        return graphics_or_standin(this, f, desc, riid, ppv, hr);
     }
     let hr = finish_pso(this, f, desc, riid, ppv);
     if hr >= 0 || !crate::gpu::shader::readable(desc as usize, std::mem::size_of::<D3D12_GRAPHICS_PIPELINE_STATE_DESC>()) {
@@ -3518,10 +3547,7 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu:
     let Some(rs) = abi_rs_for(this, &tp.samplers) else { return E_INVALIDARG };
     let fs: PsoFn = std::mem::transmute(orig_fn(this, slot_of(this, "CreatePipelineState")));
     let desc: [usize; 2] = [stream.0.len(), stream.0.as_ptr() as usize];
-    // `XCL_TWO_PASS=0`: no mesh pipelines from console MS / GS (they get the stand-in a
-    // pipeline without a translation gets) – to see whether a fault comes from them
-    if !env_on_default("XCL_TWO_PASS", true) {
-        note_translation_error(format!("mesh pipeline from the console {kind} not made (XCL_TWO_PASS=0)"));
+    if !two_pass_enabled() {
         return E_INVALIDARG;
     }
     let removed_before = device_removed_now();
@@ -3554,6 +3580,32 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu:
         crate::xlog_info!("D3D12.X: pipeline from the console {kind} in two passes (compute {} B + mesh {} B DXIL)", tp.cs.len(), tp.ms.len());
     }
     hr
+}
+
+/// Whether pipelines from console MS / GS are built in two passes (`XCL_TWO_PASS=1`). Off by
+/// default: drawing with them is not written yet (the compute pass is never run, and the
+/// title's DispatchMesh / Draw* reach the mesh pipeline with its own root signature bound –
+/// the runtime refuses the list and removes the device with DXGI_ERROR_INVALID_CALL at its
+/// submission). Until then such pipelines get a stand-in that draws nothing.
+fn two_pass_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = env_on_default("XCL_TWO_PASS", false);
+        if !on {
+            crate::xlog_info!("D3D12.X: pipelines from console MS / GS get a stand-in that draws nothing (their two-pass drawing is not written yet; XCL_TWO_PASS=1 builds them)");
+        }
+        on
+    })
+}
+
+/// A console pipeline XCL could not (or does not) build: the title gets a stand-in that draws
+/// nothing instead of a failure – titles stop on a failed pipeline (a write to address 0).
+fn note_standin_for_untranslated(what: &str, hr: HRESULT) {
+    static N: AtomicU64 = AtomicU64::new(0);
+    let n = N.fetch_add(1, Ordering::Relaxed);
+    if n < 3 || n % 1000 == 0 {
+        crate::xlog_info!("D3D12.X: {what} without a translation ({hr:#x}) – a stand-in that draws nothing instead ({} so far)", n + 1);
+    }
 }
 
 /// The device is removed (now).
@@ -3621,6 +3673,9 @@ unsafe fn translated_mesh_stream(this: *mut c_void, desc: *const c_void, riid: *
             crate::gpu::shader::fnv64(a),
             crate::gpu::shader::fnv64(ms)
         ));
+        return Some(E_INVALIDARG);
+    }
+    if !two_pass_enabled() {
         return Some(E_INVALIDARG);
     }
     let ps = subs.iter().find(|s| s.0 == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS.0 as u32).and_then(|s| payload_shader(s.1));
@@ -4027,10 +4082,10 @@ pub(super) unsafe extern "system" fn dev_create_pipeline_state(this: *mut c_void
             return hr;
         }
         if let Some(hr) = crate::gpu::recomp::dxc::urgent(|| translated_mesh_stream(this, desc, riid, ppv)) {
-            return hr;
+            return stream_or_standin(this, f, desc, riid, ppv, hr);
         }
     } else if let Some(hr) = translated {
-        return hr;
+        return stream_or_standin(this, f, desc, riid, ppv, hr);
     }
     match stream_pipeline(desc) {
         StreamPipeline::Graphics(d) => return dev_create_graphics_pso(this, &*d as *const _ as *const c_void, riid, ppv),

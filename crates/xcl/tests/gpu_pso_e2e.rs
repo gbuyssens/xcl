@@ -49,6 +49,9 @@ fn mesh_shaders(dev: &ID3D12Device) -> bool {
 /// counters.
 fn setup(names: &[&str]) -> Option<(Vec<Vec<u8>>, ID3D12Device, std::sync::MutexGuard<'static, ()>)> {
     let serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    // mesh pipelines from console MS / GS are built in two passes only on request (their
+    // drawing is not written yet); these tests check how they are built
+    std::env::set_var("XCL_TWO_PASS", "1");
     static PACK: OnceLock<Option<Vec<u8>>> = OnceLock::new();
     let data = PACK.get_or_init(|| std::env::var("XCL_SAMPLE_RPF").ok().and_then(|p| std::fs::read(p).ok())).as_ref();
     let Some(data) = data else {
