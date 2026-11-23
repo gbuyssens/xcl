@@ -19,6 +19,11 @@ struct Pending {
     compute: bool,
     /// the stand-in was released before the real pipeline was built
     orphan: std::sync::atomic::AtomicBool,
+    /// the build, until a worker – or a title thread that cannot wait for the queue
+    /// (`resolve_wait`) – takes it
+    job: Mutex<Option<Job>>,
+    /// sent to the workers (a lazy pipeline is sent at its first use)
+    queued: std::sync::atomic::AtomicBool,
 }
 
 /// stand-in handed to the title → its real pipeline
@@ -33,42 +38,51 @@ pub fn enabled() -> bool {
 /// Builds the real pipeline: its raw pointer, 0 = failed.
 pub type Job = Box<dyn FnOnce() -> usize + Send>;
 
-fn queue() -> &'static Mutex<mpsc::Sender<(Arc<Pending>, Job)>> {
-    static Q: OnceLock<Mutex<mpsc::Sender<(Arc<Pending>, Job)>>> = OnceLock::new();
+/// Stack of the threads that build pipelines: translation recurses deeply on big programs.
+const BUILD_STACK: usize = 64 << 20;
+
+fn queue() -> &'static Mutex<mpsc::Sender<Arc<Pending>>> {
+    static Q: OnceLock<Mutex<mpsc::Sender<Arc<Pending>>>> = OnceLock::new();
     Q.get_or_init(|| {
-        let (tx, rx) = mpsc::channel::<(Arc<Pending>, Job)>();
+        let (tx, rx) = mpsc::channel::<Arc<Pending>>();
         let rx = Arc::new(Mutex::new(rx));
-        // translation recurses deeply on big programs; DXC itself runs on its own pool
+        // DXC itself runs on its own pool
         let n = crate::gpu::recomp::dxc::compile_threads();
         for k in 0..n {
             let rx = rx.clone();
-            let _ = std::thread::Builder::new().name(format!("xcl-pso-{k}")).stack_size(64 << 20).spawn(move || loop {
+            let _ = std::thread::Builder::new().name(format!("xcl-pso-{k}")).stack_size(BUILD_STACK).spawn(move || loop {
                 let next = rx.lock().unwrap().recv();
-                let Ok((p, job)) = next else { return };
-                let real = job();
-                if real == 0 {
-                    FAILED.fetch_add(1, Ordering::Relaxed);
-                } else {
-                    BUILT.fetch_add(1, Ordering::Relaxed);
-                }
-                let orphan = {
-                    let mut done = p.done.lock().unwrap();
-                    let orphan = p.orphan.load(Ordering::Acquire);
-                    if !orphan {
-                        p.real.store(real, Ordering::Release);
-                    }
-                    *done = true;
-                    p.cv.notify_all();
-                    orphan
-                };
-                // outside `done`: the Release override takes PENDING (`counts` takes PENDING, then `done`)
-                if orphan {
-                    release(real);
-                }
+                let Ok(p) = next else { return };
+                // a title thread may have taken it already (`resolve_wait`)
+                let Some(job) = p.job.lock().unwrap().take() else { continue };
+                finish(&p, job());
             });
         }
         Mutex::new(tx)
     })
+}
+
+/// Hand a built pipeline (0 = failed) to whoever waits for it.
+fn finish(p: &Pending, real: usize) {
+    if real == 0 {
+        FAILED.fetch_add(1, Ordering::Relaxed);
+    } else {
+        BUILT.fetch_add(1, Ordering::Relaxed);
+    }
+    let orphan = {
+        let mut done = p.done.lock().unwrap();
+        let orphan = p.orphan.load(Ordering::Acquire);
+        if !orphan {
+            p.real.store(real, Ordering::Release);
+        }
+        *done = true;
+        p.cv.notify_all();
+        orphan
+    };
+    // outside `done`: the Release override takes PENDING (`counts` takes PENDING, then `done`)
+    if orphan {
+        release(real);
+    }
 }
 
 /// Release a pipeline state XCL owns (raw pointer, 0 = none).
@@ -80,13 +94,53 @@ pub fn release(p: usize) {
 
 /// `standin` went to the title; `job` builds the real pipeline on a worker.
 pub fn submit(standin: usize, compute: bool, job: Job) {
-    let p = Arc::new(Pending { real: AtomicUsize::new(0), done: Mutex::new(false), cv: Condvar::new(), compute, orphan: Default::default() });
-    PENDING.lock().unwrap().get_or_insert_with(HashMap::new).insert(standin, p.clone());
+    let p = pending(standin, compute, job);
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
         crate::xlog_info!("D3D12.X: pipelines whose shaders are not compiled yet get a stand-in and are built in the background");
     });
-    let _ = queue().lock().unwrap().send((p, job));
+    send(p);
+}
+
+/// Pipelines built at their first use (`submit_lazy`), `XCL_LAZY_PSO=0` to build each when
+/// the title creates it. A title can create far more pipelines than it draws with: the retail
+/// GTA VI creates ~51 000 different ones in its first 30 s; each a pipeline in AMD's driver
+/// (~400 KB of its heap) took 20 GB of commit and the system ran out.
+pub fn lazy() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| enabled() && std::env::var("XCL_LAZY_PSO").map_or(true, |v| v != "0"))
+}
+
+/// `submit`, the build waiting for the stand-in's first use (`resolve`, `resolve_wait`).
+pub fn submit_lazy(standin: usize, compute: bool, job: Job) {
+    pending(standin, compute, job);
+    let n = LAZY.fetch_add(1, Ordering::Relaxed) + 1;
+    if n == 1 || n % 10_000 == 0 {
+        crate::xlog_info!("D3D12.X: pipelines are built at their first use ({n} created so far)");
+    }
+}
+
+static LAZY: AtomicUsize = AtomicUsize::new(0);
+
+fn pending(standin: usize, compute: bool, job: Job) -> Arc<Pending> {
+    let p = Arc::new(Pending {
+        real: AtomicUsize::new(0),
+        done: Mutex::new(false),
+        cv: Condvar::new(),
+        compute,
+        orphan: Default::default(),
+        job: Mutex::new(Some(job)),
+        queued: Default::default(),
+    });
+    PENDING.lock().unwrap().get_or_insert_with(HashMap::new).insert(standin, p.clone());
+    p
+}
+
+/// To the workers, once.
+fn send(p: Arc<Pending>) {
+    if !p.queued.swap(true, Ordering::AcqRel) {
+        let _ = queue().lock().unwrap().send(p);
+    }
 }
 
 fn entry(pso: usize) -> Option<Arc<Pending>> {
@@ -95,15 +149,36 @@ fn entry(pso: usize) -> Option<Arc<Pending>> {
 
 /// The pipeline to use for `pso` now: the real one once built, else `pso` itself.
 pub fn resolve(pso: usize) -> usize {
-    match entry(pso).map(|p| p.real.load(Ordering::Acquire)) {
-        Some(r) if r != 0 => r,
-        _ => pso,
+    let Some(p) = entry(pso) else { return pso };
+    match p.real.load(Ordering::Acquire) {
+        0 => {
+            // a lazy pipeline's first use: build it now (the stand-in draws nothing meanwhile)
+            send(p);
+            pso
+        }
+        r => r,
     }
 }
 
 /// `resolve`, waiting for a pipeline still being built.
 pub fn resolve_wait(pso: usize) -> usize {
     let Some(p) = entry(pso) else { return pso };
+    // not started yet: build it now instead of waiting behind the whole queue (thousands of
+    // pipelines while a title loads – GTA VI's watchdog killed the game while a title thread
+    // waited here), on a thread with the translator's stack, its compiles first
+    let job = p.job.lock().unwrap().take();
+    if let Some(job) = job {
+        let real = std::thread::scope(|s| {
+            std::thread::Builder::new()
+                .name("xcl-pso-urgent".into())
+                .stack_size(BUILD_STACK)
+                .spawn_scoped(s, || crate::gpu::recomp::dxc::urgent(job))
+                .ok()
+                .and_then(|t| t.join().ok())
+                .unwrap_or(0)
+        });
+        finish(&p, real);
+    }
     let mut done = p.done.lock().unwrap();
     while !*done {
         done = p.cv.wait(done).unwrap();
