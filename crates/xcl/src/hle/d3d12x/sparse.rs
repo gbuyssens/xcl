@@ -34,8 +34,6 @@ use windows_sys::Win32::System::Memory::{
 const TILE: usize = 0x1_0000;
 /// tiles of a video-memory pool heap (64 MiB)
 const POOL_TILES: u32 = 1024;
-/// idle pools kept for the next allocations instead of being released (128 MiB)
-const RESERVE_POOLS: usize = 2;
 /// bytes of the ring-buffered upload staging buffer
 const STAGING: usize = 64 << 20;
 /// alignment of sub-allocations inside the upload staging ring (write-combined cacheline)
@@ -189,17 +187,6 @@ fn decommit_tiles(
     unmapped
 }
 
-/// The pools to release: those live and entirely free (`pool_free[h] == POOL_TILES`), beyond
-/// the `RESERVE_POOLS` lowest-numbered ones kept (their tiles sit deepest in the free stack, so
-/// the next allocations drain the kept pools last and the released ones were the least used).
-fn pools_to_release(pool_free: &[u32], live: &[bool]) -> Vec<u32> {
-    let idle: Vec<u32> = (0..pool_free.len() as u32).filter(|&h| live[h as usize] && pool_free[h as usize] == POOL_TILES).collect();
-    if idle.len() <= RESERVE_POOLS {
-        return Vec::new();
-    }
-    idle[RESERVE_POOLS..].to_vec()
-}
-
 struct UploadSlot {
     alloc: ID3D12CommandAllocator,
     list: ID3D12GraphicsCommandList,
@@ -218,12 +205,7 @@ struct State {
     rb_value: u64,
     /// (window start, reserved buffer) of each sparse window
     windows: Vec<(usize, ID3D12Resource)>,
-    /// pool heaps of `POOL_TILES` tiles (None: released again, its slot reusable)
-    pools: Vec<Option<ID3D12Heap>>,
-    /// free tiles of each pool (`POOL_TILES`: nothing maps or pins the pool, it can go)
-    pool_free: Vec<u32>,
-    /// released pool heaps kept until the fence value their last unmapping signalled
-    retired: Vec<(u64, ID3D12Heap)>,
+    pools: Vec<ID3D12Heap>,
     free: Vec<(u32, u32)>,
     /// tile address → pool tile + uncommitted page hole mask + per-page sent chunk hashes
     mapped: FxHashMap<usize, TileEntry>,
@@ -473,8 +455,6 @@ pub unsafe fn init(dev: &ID3D12Device) -> Vec<(usize, usize, u64)> {
             rb_value: 0,
             windows,
             pools: Vec::new(),
-            pool_free: Vec::new(),
-            retired: Vec::new(),
             free: Vec::new(),
             mapped: FxHashMap::default(),
             pinned: FxHashMap::default(),
@@ -521,10 +501,8 @@ impl State {
 
     unsafe fn take_tile(&mut self) -> Option<((u32, u32), bool)> {
         if let Some(t) = self.free.pop() {
-            self.pool_free[t.0 as usize] -= 1;
             return Some((t, true));
         }
-        self.reap_retired();
         let desc = D3D12_HEAP_DESC {
             SizeInBytes: POOL_TILES as u64 * TILE as u64,
             Properties: D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
@@ -536,69 +514,10 @@ impl State {
             crate::xlog_warn!("sparse windows: no video memory for more tiles ({e})");
             return None;
         }
-        let heap = heap?;
-        let h = match self.pools.iter().position(|p| p.is_none()) {
-            Some(slot) => {
-                self.pools[slot] = Some(heap);
-                slot as u32
-            }
-            None => {
-                self.pools.push(Some(heap));
-                self.pool_free.push(0);
-                (self.pools.len() - 1) as u32
-            }
-        };
-        self.pool_free[h as usize] = POOL_TILES - 1;
+        let h = self.pools.len() as u32;
+        self.pools.push(heap?);
         self.free.extend((1..POOL_TILES).rev().map(|t| (h, t)));
         Some(((h, 0), false))
-    }
-
-    /// The heap of pool `h` (a tile in `free` or `mapped` always belongs to a live pool).
-    #[inline]
-    fn pool(&self, h: u32) -> &ID3D12Heap {
-        self.pools[h as usize].as_ref().expect("sparse windows: a tile of a released pool")
-    }
-
-    /// Pool tiles pushed onto `free` since it had `before` entries: count them per pool.
-    fn count_freed(&mut self, before: usize) {
-        for i in before..self.free.len() {
-            self.pool_free[self.free[i].0 as usize] += 1;
-        }
-    }
-
-    /// Pools nothing maps or pins any more give their video memory back, except for
-    /// `RESERVE_POOLS` kept for the next allocations. The heaps go only once the GPU has passed
-    /// the unmappings queued before (`retired`, reaped later).
-    unsafe fn trim_pools(&mut self) {
-        let live: Vec<bool> = self.pools.iter().map(|p| p.is_some()).collect();
-        let gone = pools_to_release(&self.pool_free, &live);
-        if gone.is_empty() {
-            return;
-        }
-        self.free.retain(|&(h, _)| !gone.contains(&h));
-        self.signal();
-        for &h in &gone {
-            self.pool_free[h as usize] = 0;
-            if let Some(heap) = self.pools[h as usize].take() {
-                self.retired.push((self.value, heap));
-            }
-        }
-        let live = self.pools.iter().filter(|p| p.is_some()).count();
-        crate::xlog_info!(
-            "sparse windows: {} idle pool(s) released ({} MiB), {live} pool(s) with {} tiles mapped remain",
-            gone.len(),
-            (gone.len() as u64 * POOL_TILES as u64 * TILE as u64) >> 20,
-            self.mapped.len()
-        );
-    }
-
-    /// Released pool heaps the GPU is done with are destroyed.
-    unsafe fn reap_retired(&mut self) {
-        if self.retired.is_empty() {
-            return;
-        }
-        let completed = self.fence.GetCompletedValue();
-        self.retired.retain(|&(v, _)| v > completed);
     }
 
     /// Map `tiles` (tile addresses) of `res` (starting at `res_base`) onto pool tiles,
@@ -642,7 +561,7 @@ impl State {
                 coords.len() as u32,
                 Some(coords.as_ptr()),
                 Some(regions.as_ptr()),
-                self.pool(h),
+                &self.pools[h as usize],
                 flags.len() as u32,
                 Some(flags.as_ptr()),
                 Some(offsets.as_ptr()),
@@ -651,7 +570,7 @@ impl State {
             );
             super::real::note_removal_after(|| {
                 let res_tiles = res.GetDesc().Width.div_ceil(TILE as u64);
-                let heap_tiles = self.pool(h).GetDesc().SizeInBytes / TILE as u64;
+                let heap_tiles = self.pools[h as usize].GetDesc().SizeInBytes / TILE as u64;
                 let last_x = coords.iter().zip(&regions).map(|(c, r)| c.X as u64 + r.NumTiles as u64).max().unwrap_or(0);
                 let last_t = offsets.iter().zip(&counts).map(|(&o, &n)| o as u64 + n as u64).max().unwrap_or(0);
                 format!("sparse windows: mapping {} run(s) of a {res_tiles}-tile resource (up to tile {last_x}) onto pool {h} of {heap_tiles} tiles (up to {last_t})", coords.len())
@@ -1274,12 +1193,10 @@ pub unsafe fn decommitted(a: usize, n: usize) {
         EARLY.lock().unwrap().retain(|&(x, m)| x + m <= a || x >= a + n);
         return;
     };
-    let free_before = s.free.len();
     let tiles = decommit_tiles(&mut s.mapped, &s.pinned, &mut s.free, &mut s.to_zero, a, n);
     if tiles.is_empty() {
         return;
     }
-    s.count_freed(free_before);
     s.runs = None;
     let mut by_window: FxHashMap<usize, Vec<usize>> = FxHashMap::default();
     for &t in &tiles {
@@ -1293,7 +1210,6 @@ pub unsafe fn decommitted(a: usize, n: usize) {
     }
     MAPPED_GEN.fetch_add(1, Ordering::Release);
     s.signal();
-    s.trim_pools();
 }
 
 impl State {
@@ -1301,7 +1217,6 @@ impl State {
     fn release_if_unused(&mut self, tile: (u32, u32)) {
         if !self.pinned.contains_key(&tile) && !self.mapped.values().any(|e| e.pool == tile) {
             self.free.push(tile);
-            self.pool_free[tile.0 as usize] += 1;
         }
     }
 }
@@ -1311,7 +1226,7 @@ impl State {
 pub fn stats() -> Option<(usize, usize)> {
     let g = STATE.try_lock().ok()?;
     let s = g.as_ref()?;
-    Some((s.mapped.len(), s.pools.iter().filter(|p| p.is_some()).count()))
+    Some((s.mapped.len(), s.pools.len()))
 }
 
 /// The sparse windows' tiles with video memory as sorted (start, end) runs: where a CPU write
@@ -1353,7 +1268,6 @@ pub unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize], page: 
     let Some(s) = g.as_mut() else { return };
     let t_locked = std::time::Instant::now();
     PHASES[0].fetch_add((t_locked - t0).as_micros() as u64, Ordering::Relaxed);
-    s.reap_retired();
     let zero_runs = std::mem::take(&mut s.to_zero);
     for &(a, n) in &zero_runs {
         s.clear_sent_range(a, n);
@@ -1486,28 +1400,11 @@ pub fn forget_buffer(res: usize) {
             }
         }
     }
-    unsafe { s.trim_pools() };
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Idle pools beyond the reserve are released, lowest-numbered kept; a pool with one tile
-    /// still mapped or pinned, or already released, is never a candidate.
-    #[test]
-    fn idle_pools_beyond_the_reserve_are_released() {
-        let full = POOL_TILES;
-        // nothing idle, or only the reserve: nothing goes
-        assert!(pools_to_release(&[full - 1, 3], &[true, true]).is_empty());
-        assert!(pools_to_release(&[full, full], &[true, true]).is_empty());
-        // three idle of four: the highest-numbered idle one goes
-        assert_eq!(pools_to_release(&[full, 7, full, full], &[true; 4]), vec![3]);
-        // a released slot (live = false) does not count, even with a stale free count
-        assert_eq!(pools_to_release(&[full, full, full, full], &[true, false, true, true]), vec![3]);
-        // everything idle: all but the first two
-        assert_eq!(pools_to_release(&[full; 5], &[true; 5]), vec![2, 3, 4]);
-    }
 
     /// Only the 64-byte chunks the CPU changed are sent again – the rest of the page may hold
     /// what the GPU wrote.
@@ -1660,8 +1557,6 @@ mod tests {
                 rb_value: 0,
                 windows: vec![(base, reserved)],
                 pools: Vec::new(),
-                pool_free: Vec::new(),
-                retired: Vec::new(),
                 free: Vec::new(),
                 mapped: FxHashMap::default(),
                 pinned: FxHashMap::default(),
