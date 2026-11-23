@@ -170,6 +170,14 @@ unsafe fn query(p: *mut c_void, own: &GUID, riid: *const GUID, out: *mut *mut c_
         return S_OK;
     }
     *out = std::ptr::null_mut();
+    // a newer DirectStorage interface version a title asks for: named, so its assert has a cause
+    if !riid.is_null() {
+        let (r, o) = (&*riid, own);
+        crate::xlog_warn!(
+            "DirectStorage: QueryInterface({:08x}-{:04x}-{:04x}-{:02x?}) on the object of {:08x}-{:04x}-{:04x} refused (E_NOINTERFACE)",
+            r.data1, r.data2, r.data3, r.data4, o.data1, o.data2, o.data3
+        );
+    }
     E_NOINTERFACE
 }
 

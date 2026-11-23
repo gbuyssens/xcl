@@ -372,6 +372,8 @@ unsafe extern "system" fn query_interface(this: *const Obj, iid: *const Guid, ou
         return S_OK;
     }
     *out = std::ptr::null_mut();
+    // a title asserting on this (a newer interface version of the class?) ends without a trace otherwise
+    crate::xlog_warn!("XGameRuntime: {} QueryInterface({}) refused (E_NOINTERFACE) – an interface version XCL's GDK table does not know?", f.name, *iid);
     E_NOINTERFACE
 }
 
