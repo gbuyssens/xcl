@@ -419,10 +419,18 @@ pub fn init() -> Result<String, String> {
     }
 }
 
-/// A debug layer message: errors and warnings into the log (the first 200).
-unsafe extern "system" fn debug_message(_category: D3D12_MESSAGE_CATEGORY, severity: D3D12_MESSAGE_SEVERITY, id: D3D12_MESSAGE_ID, text: windows::core::PCSTR, _context: *mut c_void) {
+/// A debug layer message: errors and warnings into the log (the first 200). Errors of object
+/// creation (why a driver refused a pipeline or a resource – the 0x80070057 of a translated
+/// PSO says nothing) have their own budget of 2 000, so other warnings cannot use it up.
+unsafe extern "system" fn debug_message(category: D3D12_MESSAGE_CATEGORY, severity: D3D12_MESSAGE_SEVERITY, id: D3D12_MESSAGE_ID, text: windows::core::PCSTR, _context: *mut c_void) {
     static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-    if severity.0 > D3D12_MESSAGE_SEVERITY_WARNING.0 || N.fetch_add(1, Ordering::Relaxed) >= 200 {
+    static CREATION: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    if severity.0 > D3D12_MESSAGE_SEVERITY_WARNING.0 {
+        return;
+    }
+    let creation_error = category == D3D12_MESSAGE_CATEGORY_STATE_CREATION && severity.0 <= D3D12_MESSAGE_SEVERITY_ERROR.0;
+    let (counter, budget) = if creation_error { (&CREATION, 2000) } else { (&N, 200) };
+    if counter.fetch_add(1, Ordering::Relaxed) >= budget {
         return;
     }
     let t = if text.is_null() { String::new() } else { String::from_utf8_lossy(text.as_bytes()).into_owned() };
