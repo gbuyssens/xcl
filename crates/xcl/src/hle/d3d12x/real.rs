@@ -376,6 +376,7 @@ pub fn init() -> Result<String, String> {
                 Ok(d) => {
                     d.SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
                     d.SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+                    crate::xlog_info!("D3D12: DRED enabled (breadcrumbs and page faults are logged on a device removal)");
                 }
                 Err(e) => {
                     crate::xlog_warn!("D3D12: DRED requested but unavailable: {e}");
