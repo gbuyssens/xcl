@@ -3518,8 +3518,18 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu:
     let Some(rs) = abi_rs_for(this, &tp.samplers) else { return E_INVALIDARG };
     let fs: PsoFn = std::mem::transmute(orig_fn(this, slot_of(this, "CreatePipelineState")));
     let desc: [usize; 2] = [stream.0.len(), stream.0.as_ptr() as usize];
+    // `XCL_TWO_PASS=0`: no mesh pipelines from console MS / GS (they get the stand-in a
+    // pipeline without a translation gets) – to see whether a fault comes from them
+    if !env_on_default("XCL_TWO_PASS", true) {
+        note_translation_error(format!("mesh pipeline from the console {kind} not made (XCL_TWO_PASS=0)"));
+        return E_INVALIDARG;
+    }
+    let removed_before = device_removed_now();
     let hr = finish_pso(this, fs, desc.as_ptr() as *const c_void, riid, ppv);
     if hr < 0 {
+        if !removed_before && device_removed_now() {
+            report_removing_mesh_pipeline(stream, &tp, kind, hr);
+        }
         note_translation_error(format!("the driver rejected the mesh pipeline from the console {kind} ({hr:#x})"));
         return E_INVALIDARG;
     }
@@ -3544,6 +3554,48 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu:
         crate::xlog_info!("D3D12.X: pipeline from the console {kind} in two passes (compute {} B + mesh {} B DXIL)", tp.cs.len(), tp.ms.len());
     }
     hr
+}
+
+/// The device is removed (now).
+fn device_removed_now() -> bool {
+    let raw = device_raw();
+    let Some(dev) = (unsafe { ID3D12Device::from_raw_borrowed(&raw) }) else { return false };
+    unsafe { dev.GetDeviceRemovedReason() }.is_err()
+}
+
+/// The device was fine before this mesh pipeline and removed by its creation: what it was made
+/// of into the log, its DXIL next to the log (`removal-ms.dxil`, `-cs`, `-stream.bin`).
+fn report_removing_mesh_pipeline(stream: &StreamOut, tp: &crate::gpu::recomp::pso::TwoPass, kind: &str, hr: HRESULT) {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let types: Vec<String> = known_subobjects(&stream.0).iter().map(|(t, p)| format!("{t}:{}", p.len())).collect();
+        crate::xlog_error!(
+            "D3D12: the device was removed by the creation of a mesh pipeline from the console {kind} ({hr:#x}): mesh {} B DXIL, compute {} B, {} mesh group(s) per record, stream {} B [{}]",
+            tp.ms.len(),
+            tp.cs.len(),
+            tp.mesh_groups_per_record,
+            stream.0.len(),
+            types.join(" ")
+        );
+        let dir = crate::state::data_dir().join("logs");
+        let _ = std::fs::create_dir_all(&dir);
+        for (name, bytes) in [("removal-ms.dxil", &tp.ms), ("removal-cs.dxil", &tp.cs), ("removal-stream.bin", &stream.0)] {
+            match std::fs::write(dir.join(name), bytes) {
+                Ok(()) => crate::xlog_error!("D3D12: … written to {}", dir.join(name).display()),
+                Err(e) => crate::xlog_warn!("D3D12: {name}: {e}"),
+            }
+        }
+        // the shaders the stream points at (PS among them) as well
+        for (k, (t, p)) in known_subobjects(&stream.0).iter().enumerate() {
+            if p.len() == 16 {
+                if let Some(code) = unsafe { payload_shader(p) } {
+                    if code.len() >= 4 && &code[0..4] == b"DXBC" {
+                        let _ = std::fs::write(dir.join(format!("removal-shader{k}-type{t}.dxil")), code);
+                    }
+                }
+            }
+        }
+    });
 }
 
 /// CreatePipelineState with a console MS: Some(hr) when it was a console mesh pipeline
@@ -4933,4 +4985,12 @@ mod stream_tests {
 /// in a console that had it on).
 fn env_on(name: &str) -> bool {
     std::env::var_os(name).is_some_and(|v| !v.is_empty() && v != "0")
+}
+
+/// A switch that is on unless set to `0` (or off unless set, with `default` false).
+fn env_on_default(name: &str, default: bool) -> bool {
+    match std::env::var_os(name) {
+        Some(v) if !v.is_empty() => v != "0",
+        _ => default,
+    }
 }
