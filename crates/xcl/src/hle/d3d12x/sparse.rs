@@ -568,6 +568,13 @@ impl State {
                 Some(counts.as_ptr()),
                 D3D12_TILE_MAPPING_FLAG_NONE,
             );
+            super::real::note_removal_after(|| {
+                let res_tiles = res.GetDesc().Width.div_ceil(TILE as u64);
+                let heap_tiles = self.pools[h as usize].GetDesc().SizeInBytes / TILE as u64;
+                let last_x = coords.iter().zip(&regions).map(|(c, r)| c.X as u64 + r.NumTiles as u64).max().unwrap_or(0);
+                let last_t = offsets.iter().zip(&counts).map(|(&o, &n)| o as u64 + n as u64).max().unwrap_or(0);
+                format!("sparse windows: mapping {} run(s) of a {res_tiles}-tile resource (up to tile {last_x}) onto pool {h} of {heap_tiles} tiles (up to {last_t})", coords.len())
+            });
         }
     }
 
@@ -606,6 +613,11 @@ impl State {
             Some(counts.as_ptr()),
             D3D12_TILE_MAPPING_FLAG_NONE,
         );
+        super::real::note_removal_after(|| {
+            let res_tiles = res.GetDesc().Width.div_ceil(TILE as u64);
+            let last_x = coords.iter().zip(&regions).map(|(c, r)| c.X as u64 + r.NumTiles as u64).max().unwrap_or(0);
+            format!("sparse windows: unmapping {} run(s) of a {res_tiles}-tile resource (up to tile {last_x})", coords.len())
+        });
     }
 
     /// tiles of `[a, a + n)` get video memory (mapped in their window); `initial_holes` supplies
@@ -706,6 +718,7 @@ impl State {
             if let Ok(l) = self.slots[idx].list.cast::<ID3D12CommandList>() {
                 super::title_textures::own_work(|| {
                     self.queue.ExecuteCommandLists(&[Some(l)]);
+                    super::real::note_removal_after(|| "sparse windows: the upload of CPU writes".into());
                 });
             }
         }
@@ -857,6 +870,7 @@ impl State {
                     if let Ok(l) = s.rb_list.cast::<ID3D12CommandList>() {
                         super::title_textures::own_work(|| {
                             s.queue.ExecuteCommandLists(&[Some(l)]);
+                            super::real::note_removal_after(|| "sparse windows: a readback".into());
                         });
                     }
                 }

@@ -656,6 +656,7 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, usize)>) {
     let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&qraw) else { return };
     let Ok(cl) = p.list.cast::<ID3D12CommandList>() else { return };
     q.ExecuteCommandLists(&[Some(cl)]);
+    super::real::note_removal_after(|| "present: the copy to the swap chain".into());
     p.copy_source = Some(src);
     p.dumps = dumps;
     p.value += 1;

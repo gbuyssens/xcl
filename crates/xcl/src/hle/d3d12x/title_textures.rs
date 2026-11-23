@@ -430,6 +430,7 @@ pub unsafe fn probe_gpu_content(res: usize) {
         list.ResourceBarrier(&[barrier(D3D12_RESOURCE_STATE_COPY_SOURCE, srv)]);
         list.Close().map_err(|e| e.to_string())?;
         queue.ExecuteCommandLists(&[Some(list.cast().map_err(|e| e.to_string())?)]);
+        super::real::note_removal_after(|| "title textures: an upload".into());
         texture::wait(dev, &queue)?;
         let mut p: *mut c_void = std::ptr::null_mut();
         rb.Map(0, None, Some(&mut p)).map_err(|e| e.to_string())?;

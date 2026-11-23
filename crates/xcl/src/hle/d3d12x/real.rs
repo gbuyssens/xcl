@@ -2034,7 +2034,12 @@ fn overrides(kind: Kind) -> Vec<(&'static str, usize)> {
             ("Close", cl_close as usize),
             ("Reset", cl_reset as usize),
         ]),
-        Kind::CommandQueue => v.extend_from_slice(&[("Release", q_release as usize), ("ExecuteCommandLists", q_execute_command_lists as usize)]),
+        Kind::CommandQueue => v.extend_from_slice(&[
+            ("Release", q_release as usize),
+            ("UpdateTileMappings", q_update_tile_mappings as usize),
+            ("CopyTileMappings", q_copy_tile_mappings as usize),
+            ("ExecuteCommandLists", q_execute_command_lists as usize),
+        ]),
         Kind::CommandAllocator => v.extend_from_slice(&[("Release", alloc_release as usize), ("Reset", alloc_reset as usize)]),
         Kind::Resource => v.extend_from_slice(&[
             ("Release", res_release as usize),
@@ -4166,6 +4171,103 @@ unsafe extern "system" fn q_release(this: *mut c_void) -> u32 {
     n
 }
 
+/// The first place XCL finds the device removed, with what was just done there. The runtime
+/// removes the device inside a void call that breaks a rule (tile mappings, submissions) and
+/// says nothing else without the debug layer: the first check after such a call names it.
+pub fn note_removal_after(what: impl FnOnce() -> String) {
+    static SEEN: AtomicBool = AtomicBool::new(false);
+    if SEEN.load(Ordering::Relaxed) {
+        return;
+    }
+    let raw = device_raw();
+    let Some(dev) = (unsafe { ID3D12Device::from_raw_borrowed(&raw) }) else { return };
+    if let Err(e) = unsafe { dev.GetDeviceRemovedReason() } {
+        if !SEEN.swap(true, Ordering::AcqRel) {
+            crate::xlog_error!("D3D12: device found removed ({:#x}) right after {}", e.code().0 as u32, what());
+        }
+    }
+}
+
+/// A resource in a line: dimension, size, format, mips, layout, flags.
+unsafe fn describe_resource(res: *mut c_void) -> String {
+    let Some(r) = ID3D12Resource::from_raw_borrowed(&res) else { return "null".into() };
+    let d = r.GetDesc();
+    format!(
+        "dimension {} {}x{}x{} format {} mips {} layout {} flags {:#x}",
+        d.Dimension.0, d.Width, d.Height, d.DepthOrArraySize, d.Format.0, d.MipLevels, d.Layout.0, d.Flags.0
+    )
+}
+
+/// command queue UpdateTileMappings (the title's own): forwarded; a removal right after it is
+/// logged with the call's ranges (the runtime refuses ranges past the resource or the heap).
+#[allow(clippy::too_many_arguments)]
+unsafe extern "system" fn q_update_tile_mappings(
+    this: *mut c_void,
+    res: *mut c_void,
+    nregions: u32,
+    coords: *const D3D12_TILED_RESOURCE_COORDINATE,
+    sizes: *const D3D12_TILE_REGION_SIZE,
+    heap: *mut c_void,
+    nranges: u32,
+    range_flags: *const i32,
+    offsets: *const u32,
+    counts: *const u32,
+    flags: i32,
+) {
+    type F = unsafe extern "system" fn(*mut c_void, *mut c_void, u32, *const D3D12_TILED_RESOURCE_COORDINATE, *const D3D12_TILE_REGION_SIZE, *mut c_void, u32, *const i32, *const u32, *const u32, i32);
+    let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "UpdateTileMappings")));
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| crate::xlog_info!("D3D12.X: the title maps tiles itself (UpdateTileMappings)"));
+    f(this, res, nregions, coords, sizes, heap, nranges, range_flags, offsets, counts, flags);
+    note_removal_after(|| {
+        let take = |n: u32| (n as usize).min(4);
+        let regions: Vec<String> = (0..take(nregions))
+            .map(|i| {
+                let c = if coords.is_null() { D3D12_TILED_RESOURCE_COORDINATE::default() } else { *coords.add(i) };
+                let n = if sizes.is_null() { 1 } else { (*sizes.add(i)).NumTiles };
+                format!("({},{},{} sub {}) x{n}", c.X, c.Y, c.Z, c.Subresource)
+            })
+            .collect();
+        let ranges: Vec<String> = (0..take(nranges))
+            .map(|i| {
+                let fl = if range_flags.is_null() { 0 } else { *range_flags.add(i) };
+                let o = if offsets.is_null() { 0 } else { *offsets.add(i) };
+                let n = if counts.is_null() { 1 } else { *counts.add(i) };
+                format!("flags {fl} offset {o} x{n}")
+            })
+            .collect();
+        let heap_size = ID3D12Heap::from_raw_borrowed(&heap).map(|h| format!("{} tiles", h.GetDesc().SizeInBytes / 0x1_0000)).unwrap_or_else(|| "none".into());
+        format!(
+            "the title's UpdateTileMappings on {} – {nregions} region(s) [{}], heap {heap_size}, {nranges} range(s) [{}], flags {flags:#x}",
+            describe_resource(res),
+            regions.join(", "),
+            ranges.join(", ")
+        )
+    });
+}
+
+/// command queue CopyTileMappings (the title's own): forwarded; a removal right after it is logged.
+unsafe extern "system" fn q_copy_tile_mappings(
+    this: *mut c_void,
+    dst: *mut c_void,
+    dst_at: *const D3D12_TILED_RESOURCE_COORDINATE,
+    src: *mut c_void,
+    src_at: *const D3D12_TILED_RESOURCE_COORDINATE,
+    size: *const D3D12_TILE_REGION_SIZE,
+    flags: i32,
+) {
+    type F = unsafe extern "system" fn(*mut c_void, *mut c_void, *const D3D12_TILED_RESOURCE_COORDINATE, *mut c_void, *const D3D12_TILED_RESOURCE_COORDINATE, *const D3D12_TILE_REGION_SIZE, i32);
+    let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "CopyTileMappings")));
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| crate::xlog_info!("D3D12.X: the title copies tile mappings itself (CopyTileMappings)"));
+    f(this, dst, dst_at, src, src_at, size, flags);
+    note_removal_after(|| {
+        let at = |p: *const D3D12_TILED_RESOURCE_COORDINATE| if p.is_null() { "-".to_string() } else { let c = *p; format!("({},{},{} sub {})", c.X, c.Y, c.Z, c.Subresource) };
+        let n = if size.is_null() { 0 } else { (*size).NumTiles };
+        format!("the title's CopyTileMappings of {n} tile(s) from {} at {} to {} at {}", describe_resource(src), at(src_at), describe_resource(dst), at(dst_at))
+    });
+}
+
 unsafe extern "system" fn alloc_release(this: *mut c_void) -> u32 {
     let f: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(orig_fn(this, 2));
     let n = f(this);
@@ -4383,6 +4485,7 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
     super::list_x::note_queue_for_lists(this as usize, &mapped);
     super::list_x::execute_with_waits(&mapped, |chunk| {
         f(this, chunk.len() as u32, chunk.as_ptr());
+        note_removal_after(|| format!("the title's ExecuteCommandLists of {} list(s) on queue {this:p}", chunk.len()));
         super::list_x::readback_sparse_writes(this, chunk);
         super::list_x::cpu_writes_after(this, chunk);
     });
