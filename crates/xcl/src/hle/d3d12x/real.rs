@@ -346,7 +346,7 @@ pub fn init() -> Result<String, String> {
             }
             crate::gpu::agility::State::NotFound => {}
         }
-        let debug = cfg.d3d12_debug || std::env::var_os("XCL_D3D12_DEBUG").is_some();
+        let debug = cfg.d3d12_debug || env_on("XCL_D3D12_DEBUG");
         if debug {
             match crate::gpu::agility::configuration_interface::<ID3D12Debug>(&CLSID_D3D12Debug) {
                 Ok(d) => {
@@ -369,7 +369,7 @@ pub fn init() -> Result<String, String> {
         // `XCL_DRED=1`: on a device removal the faulting address and the last GPU operations
         // (logged by `log_device_removed`); no debug layer needed. Opt-in: with it XDefiant
         // stalled in its first seconds twice.
-        if std::env::var_os("XCL_DRED").is_some() {
+        if env_on("XCL_DRED") {
             match crate::gpu::agility::configuration_interface::<ID3D12DeviceRemovedExtendedDataSettings>(
                 &CLSID_D3D12DeviceRemovedExtendedData,
             ) {
@@ -4824,4 +4824,10 @@ mod stream_tests {
         let desc: [usize; 2] = [pc.0.len(), pc.0.as_ptr() as usize];
         assert!(unsafe { pc_stream_types(desc.as_ptr() as *const c_void) }.is_none());
     }
+}
+
+/// A diagnostic switch: set to anything but an empty value or `0` (so `set XCL_X=0` turns it off
+/// in a console that had it on).
+fn env_on(name: &str) -> bool {
+    std::env::var_os(name).is_some_and(|v| !v.is_empty() && v != "0")
 }
