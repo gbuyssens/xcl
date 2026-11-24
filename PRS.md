@@ -48,6 +48,42 @@ helper probes). Then post, with the real numbers:
 If `v_sub_f16` under mode 0x4 fails on your card too, say so in the comment instead of the
 "Not tested" line and do not claim the test passes.
 
+
+## NEW – `pr/dxc-strip`: "Recompiler: DXC gets the code without indentation and comment lines; the -O level counts code"
+Branch on upstream 9e3831e, one commit, 2 files (~60 lines + test). Open against `xcl-dev/xcl` main
+and link it in #1269. Before opening: `cargo test --workspace -- --test-threads=4` on your machine
+(the new test `dxc_gets_the_code_without_indentation_and_comment_lines` is CPU-only), then a smoke
+run on main and on the PR head (`scripts/smoke.ps1 -Game <folder>`), both blocks pasted. Fill every
+<…>; name the AI tool and model yourself under AI use.
+
+> Part of #1269.
+>
+> A translated program's HLSL is 30.7 % leading indentation and 25.0 % `// pc: instruction` comment
+> lines (throny's measurement over the pack's 2 689 compute programs), and `compile_here` chose -O0
+> above 8 MB and -O1 above 1 MB of that text. A 9.9 MB program with 4.4 MB of code was compiled at
+> -O0: DXIL 0.95x the source instead of 0.28x, and the driver did not finish it.
+>
+> **What is in it**
+> - `dxc::for_dxc`: DXC gets the text without the indentation and with the comment lines emptied
+>   (kept, not removed: its error line numbers still match the dumped HLSL); the -O level is chosen
+>   on that text, so it counts code.
+> - The DXIL cache stays keyed on the full text: nothing cached is built again.
+> - `XCL_DXC_STRIP=0` turns it off, for A/B measurements with the harness in #1269.
+> - It does not rescue the two 30 MB programs (13 MB of code): those need #1316.
+>
+> **Tested:** <GPU + driver>, <CPU>, rustc <version>, release.
+> `cargo test --workspace -- --test-threads=4`: <N> passed, <N> failed, <N> ignored (SKIPPED GPU tests: <…>).
+>
+> **Regression run**
+> main: <xcl-smoke block>
+> PR: <xcl-smoke block>
+>
+> **Not tested:** DXC time and DXIL size per program before / after on the full pack – measurable
+> with throny's harness (`xcl shaders --precompile --only cs`, `XCL_DXC_STRIP=0` for the baseline);
+> AMD.
+>
+> **AI use:** <tool and model>, wrote the function and the test from the thread's numbers; every line read.
+
 ## Nothing else to open
 `pr/xg-resource-tiling`, `pr/memory-report`: superseded. Any new PR must follow the format above
 and carry a smoke run; the fork's main is a merge of upstream 9e3831e plus the fork's diagnostics.
