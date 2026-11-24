@@ -25,6 +25,9 @@ struct State {
     /// the graphics root signature's layout and arguments
     layout_gfx: Option<Arc<Layout>>,
     args_gfx: Vec<u8>,
+    /// the title's graphics root signature (a PC object), bound before a draw with an
+    /// untranslated pipeline – created with it – since SetGraphicsRootSignature binds nothing
+    rs_gfx: usize,
     pso: usize,
     allocator: usize,
     /// unified memory of this recording (io, argument tables)
@@ -78,6 +81,7 @@ pub(super) fn reset(list: *mut c_void, allocator: usize, initial_pso: usize) {
         s.args.clear();
         s.layout_gfx = None;
         s.args_gfx.clear();
+        s.rs_gfx = 0;
         (old, std::mem::take(&mut s.uma))
     });
     console_list::hold_until_reset(old, blocks);
@@ -92,6 +96,7 @@ pub(super) fn clear_state(list: *mut c_void, pso: usize) {
         s.args.clear();
         s.layout_gfx = None;
         s.args_gfx.clear();
+        s.rs_gfx = 0;
     });
 }
 
@@ -151,6 +156,7 @@ pub(super) unsafe extern "system" fn set_graphics_root_signature(this: *mut c_vo
     with(this, |s| {
         s.args_gfx = vec![0u8; layout.as_ref().map_or(0, |l| l.size as usize)];
         s.layout_gfx = layout;
+        s.rs_gfx = rs as usize;
     });
 }
 
@@ -237,10 +243,73 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
     }
 }
 
+/// A DrawInstanced of the console's rect list (three corners of each rectangle, the fourth
+/// implied) as two triangles a rectangle; false: not a rect list, or one this cannot expand
+/// (the caller draws the three vertices as a triangle – half of each rectangle).
+///
+/// The PC has no rect lists. The fourth corner is made here, on the CPU, from the title's
+/// vertex data: v3 = v0 + v2 − v1 (seen in a retail title's full-screen passes: (−1,1) (−1,−1)
+/// (1,−1) with texture coordinates (0,0) (0,1) (1,1) – the missing corner is (1,1), (1,0)).
+/// The vertex layout is not looked at: each 4-byte word that is the same in all three vertices
+/// is kept (a packed colour), any other is taken as a float. Vertices a shader makes from the
+/// vertex index alone (no vertex buffer) are not expanded.
+unsafe fn draw_rects(this: *mut c_void, list: &ID3D12GraphicsCommandList, vertices: u32, instances: u32, first_vertex: u32, first_instance: u32) -> bool {
+    let Some(vbs) = super::list_x::rect_list_state(this) else { return false };
+    let rects = (vertices / 3) as usize;
+    if vbs.is_empty() || rects == 0 || rects > 4096 {
+        return false;
+    }
+    let mut views = Vec::new();
+    for &(slot, (va, bytes, stride), _) in &vbs {
+        let (s, at) = (stride as usize, va as usize + first_vertex as usize * stride as usize);
+        let len = rects * 3 * s;
+        if va == 0 || s == 0 || s % 4 != 0 || first_vertex as usize * s + len > bytes as usize || !crate::gpu::shader::readable(at, len) {
+            return false;
+        }
+        let p = allocate_upload_memory(this, rects * 6 * s, 16);
+        if p.is_null() {
+            return false;
+        }
+        let word = |v: usize, w: usize| (at as *const u8).add(v * s + w * 4).cast::<u32>().read_unaligned();
+        for r in 0..rects {
+            let out = p.add(r * 6 * s);
+            let src = (at as *const u8).add(r * 3 * s);
+            // v0 v1 v2, then v0 v2 v3
+            std::ptr::copy_nonoverlapping(src, out, 3 * s);
+            std::ptr::copy_nonoverlapping(src, out.add(3 * s), s);
+            std::ptr::copy_nonoverlapping(src.add(2 * s), out.add(4 * s), s);
+            for w in 0..s / 4 {
+                let (a, b, c) = (word(r * 3, w), word(r * 3 + 1, w), word(r * 3 + 2, w));
+                let d = if a == b && b == c { a } else { (f32::from_bits(a) + f32::from_bits(c) - f32::from_bits(b)).to_bits() };
+                out.add(5 * s + w * 4).cast::<u32>().write_unaligned(d);
+            }
+        }
+        views.push((slot, D3D12_VERTEX_BUFFER_VIEW { BufferLocation: super::list_x::pc_va_of(p as u64), SizeInBytes: (rects * 6 * s) as u32, StrideInBytes: stride }));
+    }
+    for (slot, v) in &views {
+        list.IASetVertexBuffers(*slot, Some(&[*v]));
+    }
+    list.DrawInstanced(rects as u32 * 6, instances, 0, first_instance);
+    for &(slot, _, pc) in &vbs {
+        if let Some(v) = pc {
+            list.IASetVertexBuffers(slot, Some(&[v]));
+        }
+    }
+    static N: AtomicU64 = AtomicU64::new(0);
+    if N.fetch_add(1, Ordering::Relaxed) == 0 {
+        crate::xlog_info!("D3D12.X: rect lists are drawn as two triangles a rectangle, the fourth corner made on the CPU");
+    }
+    true
+}
+
 /// #12 DrawInstanced
 pub(super) unsafe extern "system" fn draw_instanced(this: *mut c_void, vertices: u32, instances: u32, first_vertex: u32, first_instance: u32) {
     DRAW_ARGS.with(|d| d.set((false, vertices, instances, first_vertex, 0)));
     if let Some(list) = graphics_bound(this) {
+        if draw_rects(this, &list, vertices, instances, first_vertex, first_instance) {
+            return;
+        }
+        super::list_x::sync_title_buffers(this, None, first_vertex, vertices, instances);
         list.DrawInstanced(vertices, instances, first_vertex, first_instance);
     }
 }
@@ -253,6 +322,7 @@ thread_local! {
 /// #13 DrawIndexedInstanced
 pub(super) unsafe extern "system" fn draw_indexed_instanced(this: *mut c_void, indices: u32, instances: u32, first_index: u32, base_vertex: i32, first_instance: u32) {
     if let Some(list) = prepare_indexed_draw(this, indices, instances, first_index, base_vertex) {
+        super::list_x::sync_title_buffers(this, Some((first_index, indices, base_vertex)), 0, 0, instances);
         emit_prepared_indexed_draw(&list, indices, instances, first_index, base_vertex, first_instance);
     }
 }
@@ -305,7 +375,14 @@ unsafe fn graphics_bound(this: *mut c_void) -> Option<ID3D12GraphicsCommandList>
                 );
             }
         }
-        return Some(list); // a PC pipeline: its own root signature and arguments
+        // a PC pipeline (also a stand-in or fallback: made with the title's root signature):
+        // the title's root signature, which nothing else binds on the PC list – a draw without
+        // one is invalid (the debug layer reports it on every GPU; WARP faults on it)
+        let rs = with(this, |s| s.rs_gfx) as *mut c_void;
+        if let Some(r) = ID3D12RootSignature::from_raw_borrowed(&rs) {
+            list.SetGraphicsRootSignature(r);
+        }
+        return Some(list);
     }
     if super::present::trace_frame() {
         trace_ui_draw(this, pso);

@@ -23,7 +23,7 @@ next steps:
 | **Unicorn Overlord** | `SEGAofAmericaInc.Pa253b0c1Y` 1.0.0.6 | ✅ | fully playable | – |
 | **Fortnite** | `436609B6.FortniteClient` 2.0.1461.7919 | ✅ | works fully, as far as the game allows without its online services | the game itself is online-only (multiplayer servers) |
 | **XDefiant** | `Ubisoft.XDefiant-Game` 1.0.0.186 | ✅ | works fully, as far as the game allows without its servers | the game's own servers have been shut down |
-| **A newer retail game** | – | 🚧 | starts in ~4 s and runs at a steady 30 fps (1 449 frames in 60 s, no crash) | the image is still black (a loading screen of 3 draws a frame); mesh pipelines with an AS slot are not supported yet |
+| **A newer retail game** | – | 🚧 | starts in ~4 s, runs at a steady 30 fps without a crash and shows its first menu (the account prompt); fits a 32 GB machine (~19 GB committed) | further than its first menu not checked yet; its minimap mesh pipelines are refused |
 
 ## Highlights
 

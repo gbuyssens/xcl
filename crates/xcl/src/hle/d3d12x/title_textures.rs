@@ -268,6 +268,7 @@ unsafe fn refresh_once(queue: *mut c_void) {
         DIRTY_BUF.with(|dcell| {
             let dirty = dcell.borrow();
             super::sparse::before_execute(q, &dirty, page as usize);
+            super::vram::before_execute(q);
         });
     }
     if dirty_len == 0 && PENDING.load(Ordering::Relaxed) == 0 {
@@ -506,6 +507,12 @@ fn watch_ranges(regions: &[(usize, usize)], mut wanted: Vec<(usize, usize)>) -> 
 unsafe fn read_committed(at: usize, len: usize) -> Vec<u8> {
     use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT};
     let mut out = vec![0u8; len];
+    // (the coherent window is committed as a whole: no `VirtualQuery`, which sizes a region by
+    // walking it)
+    if crate::gpu::uma::get().is_some_and(|u| u.in_committed_window(at, len)) {
+        std::ptr::copy_nonoverlapping(at as *const u8, out.as_mut_ptr(), len);
+        return out;
+    }
     let mut p = at;
     while p < at + len {
         let mut m: MEMORY_BASIC_INFORMATION = std::mem::zeroed();

@@ -537,6 +537,10 @@ unsafe fn snapshot_page_array(ptr: u64, offset: u16, byte_len: u32) -> Result<Ve
 /// Whether `n` bytes at `p` are committed, writable memory.
 fn writable(p: usize, n: usize) -> bool {
     let Some(end) = p.checked_add(n) else { return false };
+    crate::hle::kernelx::lazy::ensure(p, n);
+    if crate::gpu::uma::get().is_some_and(|u| u.in_committed_window(p, n)) {
+        return true;
+    }
     let mut at = p;
     while at < end {
         let mut m: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
@@ -565,6 +569,15 @@ fn read_exact_at(f: &std::fs::File, offset: u64, buf: &mut [u8]) -> Result<(), H
     Ok(())
 }
 
+static REQUESTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static FAILED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// (requests run, bytes delivered, requests failed) so far
+pub fn counters() -> (u64, u64, u64) {
+    (REQUESTS.load(Ordering::Relaxed), BYTES.load(Ordering::Relaxed), FAILED.load(Ordering::Relaxed))
+}
+
 /// Run a request; the destination gets the bytes or nothing.
 unsafe fn execute(r: &Request, file: Option<&FileInner>, dest_pages: Option<&[usize]>, src_pages: Option<&[usize]>) -> Result<(), HRESULT> {
     let n = r.destination_size as usize;
@@ -572,6 +585,8 @@ unsafe fn execute(r: &Request, file: Option<&FileInner>, dest_pages: Option<&[us
         // the first requests: where a title's data goes and how it is packed
         static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let k = N.fetch_add(1, Ordering::Relaxed);
+        REQUESTS.fetch_add(1, Ordering::Relaxed);
+        BYTES.fetch_add(n as u64, Ordering::Relaxed);
         if k < 16 || k.is_power_of_two() {
             crate::xlog_info!(
                 "DirectStorage: request #{k}: options {:#x} ({} source{}), destination {:#x}{} ({n} bytes, page offset {}), source size {}, intermediate {}",
@@ -722,9 +737,11 @@ struct QueueInner {
 
 impl QueueInner {
     fn fail(&self, hr: HRESULT, request: Request, file: Option<&FileInner>) {
+        FAILED.fetch_add(1, Ordering::Relaxed);
         let mut e = self.errors.lock().unwrap();
         e.0 += 1;
         if e.1.is_none() {
+            crate::xlog_warn!("DirectStorage: a request failed ({hr:#x}): {} bytes from {}", request.destination_size, file.map(|f| String::from_utf16_lossy(&f.path)).unwrap_or_default());
             e.1 = Some(FirstError { hr, request, file: file.map(|f| f.path.clone()).unwrap_or_default() });
         }
         unsafe { SetEvent(self.error_event as HANDLE) };

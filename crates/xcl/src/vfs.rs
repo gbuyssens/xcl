@@ -464,6 +464,14 @@ impl Vfs {
         self.record_write(rel);
     }
 
+    /// Record removal of an overlay file and hide the game file it covered.
+    pub fn commit_overlay_removal(&self, rel: &str) {
+        if Path::new(&self.original_path(rel)).exists() {
+            self.add_whiteout(rel);
+        }
+        self.record_write(rel);
+    }
+
     /// Ensure `rel` exists in the overlay (copying the original when `keep_content`)
     /// and return the overlay path.
     pub fn prepare_write(&self, rel: &str, keep_content: bool) -> Result<String, u32> {
@@ -560,10 +568,7 @@ impl Vfs {
                 return Err(ERROR_ACCESS_DENIED);
             }
             std::fs::remove_file(ov_path).map_err(|_| ERROR_ACCESS_DENIED)?;
-            if Path::new(&self.original_path(rel)).exists() {
-                self.add_whiteout(rel);
-            }
-            self.record_write(rel);
+            self.commit_overlay_removal(rel);
             return Ok(());
         }
         if !self.visible_in_original(rel) {

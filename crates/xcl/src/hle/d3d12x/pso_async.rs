@@ -12,6 +12,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock};
 
 struct Pending {
+    /// the build, until a worker – or a bind that cannot wait for the queue – takes it
+    job: Mutex<Option<Job>>,
+    /// the build went to the workers (a lazy one goes on its first `resolve`)
+    sent: std::sync::atomic::AtomicBool,
     /// the real pipeline state (raw pointer), 0 while building or when building failed
     real: AtomicUsize,
     done: Mutex<bool>,
@@ -19,51 +23,13 @@ struct Pending {
     compute: bool,
     /// the stand-in was released before the real pipeline was built
     orphan: std::sync::atomic::AtomicBool,
-    /// the build, until a worker – or a title thread that cannot wait for the queue
-    /// (`resolve_wait`) – takes it
-    job: Mutex<Option<Job>>,
-    /// sent to the workers (a lazy pipeline is sent at its first use)
-    queued: std::sync::atomic::AtomicBool,
 }
 
 /// stand-in handed to the title → its real pipeline
 static PENDING: Mutex<Option<HashMap<usize, Arc<Pending>>>> = Mutex::new(None);
-static BUILT: AtomicUsize = AtomicUsize::new(0);
-static FAILED: AtomicUsize = AtomicUsize::new(0);
 
-pub fn enabled() -> bool {
-    std::env::var("XCL_ASYNC_PSO").map_or(true, |v| v != "0")
-}
-
-/// Builds the real pipeline: its raw pointer, 0 = failed.
-pub type Job = Box<dyn FnOnce() -> usize + Send>;
-
-/// Stack of the threads that build pipelines: translation recurses deeply on big programs.
-const BUILD_STACK: usize = 64 << 20;
-
-fn queue() -> &'static Mutex<mpsc::Sender<Arc<Pending>>> {
-    static Q: OnceLock<Mutex<mpsc::Sender<Arc<Pending>>>> = OnceLock::new();
-    Q.get_or_init(|| {
-        let (tx, rx) = mpsc::channel::<Arc<Pending>>();
-        let rx = Arc::new(Mutex::new(rx));
-        // DXC itself runs on its own pool
-        let n = crate::gpu::recomp::dxc::compile_threads();
-        for k in 0..n {
-            let rx = rx.clone();
-            let _ = std::thread::Builder::new().name(format!("xcl-pso-{k}")).stack_size(BUILD_STACK).spawn(move || loop {
-                let next = rx.lock().unwrap().recv();
-                let Ok(p) = next else { return };
-                // a title thread may have taken it already (`resolve_wait`)
-                let Some(job) = p.job.lock().unwrap().take() else { continue };
-                finish(&p, job());
-            });
-        }
-        Mutex::new(tx)
-    })
-}
-
-/// Hand a built pipeline (0 = failed) to whoever waits for it.
-fn finish(p: &Pending, real: usize) {
+/// The build is done (`real`: its pipeline, 0 = failed).
+fn complete(p: &Pending, real: usize) {
     if real == 0 {
         FAILED.fetch_add(1, Ordering::Relaxed);
     } else {
@@ -84,6 +50,38 @@ fn finish(p: &Pending, real: usize) {
         release(real);
     }
 }
+static BUILT: AtomicUsize = AtomicUsize::new(0);
+static FAILED: AtomicUsize = AtomicUsize::new(0);
+
+pub fn enabled() -> bool {
+    std::env::var("XCL_ASYNC_PSO").map_or(true, |v| v != "0")
+}
+
+/// Builds the real pipeline: its raw pointer, 0 = failed.
+pub type Job = Box<dyn FnOnce() -> usize + Send>;
+
+fn queue() -> &'static Mutex<mpsc::Sender<Arc<Pending>>> {
+    static Q: OnceLock<Mutex<mpsc::Sender<Arc<Pending>>>> = OnceLock::new();
+    Q.get_or_init(|| {
+        let (tx, rx) = mpsc::channel::<Arc<Pending>>();
+        let rx = Arc::new(Mutex::new(rx));
+        // translation recurses deeply on big programs; DXC itself runs on its own pool
+        let n = crate::gpu::recomp::dxc::compile_threads();
+        for k in 0..n {
+            let rx = rx.clone();
+            let _ = std::thread::Builder::new().name(format!("xcl-pso-{k}")).stack_size(64 << 20).spawn(move || loop {
+                let next = rx.lock().unwrap().recv();
+                let Ok(p) = next else { return };
+                // (None: a bind took it and builds it itself)
+                let job = p.job.lock().unwrap().take();
+                if let Some(job) = job {
+                    complete(&p, job());
+                }
+            });
+        }
+        Mutex::new(tx)
+    })
+}
 
 /// Release a pipeline state XCL owns (raw pointer, 0 = none).
 pub fn release(p: usize) {
@@ -94,51 +92,40 @@ pub fn release(p: usize) {
 
 /// `standin` went to the title; `job` builds the real pipeline on a worker.
 pub fn submit(standin: usize, compute: bool, job: Job) {
-    let p = pending(standin, compute, job);
-    static ONCE: std::sync::Once = std::sync::Once::new();
-    ONCE.call_once(|| {
-        crate::xlog_info!("D3D12.X: pipelines whose shaders are not compiled yet get a stand-in and are built in the background");
-    });
-    send(p);
+    submit_as(standin, compute, job, true);
 }
 
-/// Pipelines built at their first use (`submit_lazy`), `XCL_LAZY_PSO=0` to build each when
-/// the title creates it. A title can create far more pipelines than it draws with: one
-/// title creates ~51 000 different ones in its first 30 s; each a pipeline in AMD's driver
-/// (~400 KB of its heap) took 20 GB of commit and the system ran out.
+/// Lazy pipeline creation (`XCL_LAZY_PSO=0`: off): a title's pipelines with console shaders get
+/// their stand-in when made and are built when first used – the first bind of a graphics one
+/// sends it to the workers, a compute one is built at its first bind. A retail game makes
+/// ~51 000 pipelines in its first 30 s and uses few; each one built stays in the driver
+/// (~400 KB), and the process ran out of commit.
 pub fn lazy() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| enabled() && std::env::var("XCL_LAZY_PSO").map_or(true, |v| v != "0"))
+    static L: OnceLock<bool> = OnceLock::new();
+    *L.get_or_init(|| enabled() && std::env::var("XCL_LAZY_PSO").map_or(true, |v| v != "0"))
 }
 
-/// `submit`, the build waiting for the stand-in's first use (`resolve`, `resolve_wait`).
+/// `submit`, sent to the workers only on its first `resolve` (`lazy`).
 pub fn submit_lazy(standin: usize, compute: bool, job: Job) {
-    pending(standin, compute, job);
-    let n = LAZY.fetch_add(1, Ordering::Relaxed) + 1;
-    if n == 1 || n % 10_000 == 0 {
-        crate::xlog_info!("D3D12.X: pipelines are built at their first use ({n} created so far)");
-    }
+    submit_as(standin, compute, job, false);
 }
 
-static LAZY: AtomicUsize = AtomicUsize::new(0);
-
-fn pending(standin: usize, compute: bool, job: Job) -> Arc<Pending> {
+fn submit_as(standin: usize, compute: bool, job: Job, send: bool) {
     let p = Arc::new(Pending {
+        job: Mutex::new(Some(job)),
+        sent: std::sync::atomic::AtomicBool::new(send),
         real: AtomicUsize::new(0),
         done: Mutex::new(false),
         cv: Condvar::new(),
         compute,
         orphan: Default::default(),
-        job: Mutex::new(Some(job)),
-        queued: Default::default(),
     });
     PENDING.lock().unwrap().get_or_insert_with(HashMap::new).insert(standin, p.clone());
-    p
-}
-
-/// To the workers, once.
-fn send(p: Arc<Pending>) {
-    if !p.queued.swap(true, Ordering::AcqRel) {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        crate::xlog_info!("D3D12.X: pipelines whose shaders are not compiled yet get a stand-in and are built in the background");
+    });
+    if send {
         let _ = queue().lock().unwrap().send(p);
     }
 }
@@ -152,32 +139,23 @@ pub fn resolve(pso: usize) -> usize {
     let Some(p) = entry(pso) else { return pso };
     match p.real.load(Ordering::Acquire) {
         0 => {
-            // a lazy pipeline's first use: build it now (the stand-in draws nothing meanwhile)
-            send(p);
+            // a lazy one is wanted now: to the workers
+            if !p.sent.swap(true, Ordering::AcqRel) {
+                let _ = queue().lock().unwrap().send(p);
+            }
             pso
         }
         r => r,
     }
 }
 
-/// `resolve`, waiting for a pipeline still being built.
+/// `resolve`, waiting for a pipeline still being built – built here if no worker has started
+/// it yet (a queue of a title's hundreds of pipelines must not hold up the one it binds now).
 pub fn resolve_wait(pso: usize) -> usize {
     let Some(p) = entry(pso) else { return pso };
-    // not started yet: build it now instead of waiting behind the whole queue (thousands of
-    // pipelines while a title loads – a title's watchdog may kill the process while one of
-    // its threads waits here), on a thread with the translator's stack, its compiles first
     let job = p.job.lock().unwrap().take();
     if let Some(job) = job {
-        let real = std::thread::scope(|s| {
-            std::thread::Builder::new()
-                .name("xcl-pso-urgent".into())
-                .stack_size(BUILD_STACK)
-                .spawn_scoped(s, || crate::gpu::recomp::dxc::urgent(job))
-                .ok()
-                .and_then(|t| t.join().ok())
-                .unwrap_or(0)
-        });
-        finish(&p, real);
+        complete(&p, job());
     }
     let mut done = p.done.lock().unwrap();
     while !*done {

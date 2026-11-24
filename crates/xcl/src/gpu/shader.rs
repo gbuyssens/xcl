@@ -212,6 +212,9 @@ pub fn readable(p: usize, len: usize) -> bool {
         Some(e) => e,
         None => return false,
     };
+    if crate::gpu::uma::get().is_some_and(|u| u.in_committed_window(p, len)) {
+        return true;
+    }
     let mut cur = p;
     while cur < end {
         let mut mbi: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };

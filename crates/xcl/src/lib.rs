@@ -8,7 +8,6 @@
 #[macro_use]
 pub mod log;
 pub mod manifest;
-pub mod memstat;
 pub mod config;
 pub mod disasm;
 pub mod eh;

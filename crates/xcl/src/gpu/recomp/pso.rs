@@ -533,23 +533,36 @@ pub fn split_wave64_forced() -> bool {
     std::env::var("XCL_SPLIT_WAVE64").is_ok_and(|v| v == "1")
 }
 
-pub fn wave32_only_for_device(device: &ID3D12Device) -> bool {
-    if split_wave64_forced() {
-        return true;
-    }
+/// Whether a wave64 VS / PS can run in 32-lane waves on the adapter: D3D12 has no `WaveSize`
+/// for graphics shaders, so the driver picks, and one whose range includes 32 may pick 32 –
+/// an RDNA2 driver (RX 6600 XT, issue #42) runs pixel shaders in waves of 32 although it
+/// reports 32–64. Such a VS / PS needs the `upper_lanes` form (`Options::split_wave64`), which
+/// checks the wave size at run time, so a driver that picks 64 lanes runs it as before.
+pub fn graphics_wave32(wave_min: u32, wave_max: u32) -> bool {
+    wave32_only(wave_min, wave_max) || wave_min <= 32
+}
+
+/// The device's wave lane range; `None` when it cannot be asked.
+fn wave_range(device: &ID3D12Device) -> Option<(u32, u32)> {
     let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
-    if unsafe {
+    unsafe {
         device.CheckFeatureSupport(
             D3D12_FEATURE_D3D12_OPTIONS1,
             &mut options as *mut _ as _,
             std::mem::size_of_val(&options) as u32,
         )
     }
-    .is_err()
-    {
-        return true;
-    }
-    wave32_only(options.WaveLaneCountMin, options.WaveLaneCountMax)
+    .ok()
+    .map(|_| (options.WaveLaneCountMin, options.WaveLaneCountMax))
+}
+
+pub fn wave32_only_for_device(device: &ID3D12Device) -> bool {
+    split_wave64_forced() || wave_range(device).is_none_or(|(min, max)| wave32_only(min, max))
+}
+
+/// `graphics_wave32` for the device: the split flag for a wave64 VS / PS. Unknown: assume so.
+pub fn graphics_wave32_for_device(device: &ID3D12Device) -> bool {
+    split_wave64_forced() || wave_range(device).is_none_or(|(min, max)| graphics_wave32(min, max))
 }
 
 /// A legacy GS pipeline: the ES variant of a console VS + the GS as one program.

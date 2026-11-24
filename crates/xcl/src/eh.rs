@@ -104,7 +104,6 @@ unsafe extern "system" fn unhandled_filter(info: *const EXCEPTION_POINTERS) -> i
             modules::describe_address(addr)
         );
         crate::xlog_error!("{msg}");
-        crate::memstat::log();
         crate::report::write_final(Some(msg));
         crate::log::flush();
     }
@@ -127,7 +126,6 @@ unsafe extern "system" fn hk_nt_terminate_process(h: isize, status: i32) -> i32 
         let (tid, stack) = (windows_sys::Win32::System::Threading::GetCurrentThreadId(), stack_callers_n(&probe as *const usize as usize, 16));
         if status != 0 {
             crate::xlog_error!("process ends with status {status:#x} (thread {tid}); on the stack: {stack}");
-            crate::memstat::log();
             dump_threads();
         } else {
             crate::xlog_info!("process ends (thread {tid}); on the stack: {stack}");

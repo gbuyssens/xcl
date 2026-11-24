@@ -372,9 +372,29 @@ pub fn wave64_programs_supported() -> Result<bool, String> {
     gpu.as_ref().map(|x| x.wave64 || x.wave32).map_err(|x| x.clone())
 }
 
+/// Whether a wave64 VS / PS may run in 32-lane waves here (`pso::graphics_wave32`): the
+/// adapter runs 32-lane waves at all, or the split form is forced. False without a usable GPU.
+pub fn graphics_wave32() -> bool {
+    if split_wave64() {
+        return true;
+    }
+    let mut g = GPU.lock().unwrap();
+    g.get_or_insert_with(init).as_ref().is_ok_and(|x| x.wave32)
+}
+
+/// The split flag for a program of `mode` on this adapter: `graphics_wave32` for a VS / PS,
+/// `split_wave64` for the rest.
+pub fn split_for(mode: &super::Mode) -> bool {
+    if matches!(mode, super::Mode::Vertex(_) | super::Mode::Pixel(_)) {
+        graphics_wave32()
+    } else {
+        split_wave64()
+    }
+}
+
 /// `Options` for programs run on this adapter: the split wave64 form where it is needed.
 pub fn options(mode: super::Mode) -> super::Options {
-    super::Options { mode, split_wave64: split_wave64(), ..Default::default() }
+    super::Options { split_wave64: split_for(&mode), mode, ..Default::default() }
 }
 
 /// A split wave64 kernel stores the upper half's SGPRs too: both halves must end with the
