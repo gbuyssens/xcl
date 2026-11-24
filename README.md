@@ -1,19 +1,11 @@
 # XCL – Xbox Series X|S → Windows compatibility layer
 
-[![Discord](https://img.shields.io/badge/Discord-join%20the%20server-5865F2?logo=discord&logoColor=white)](https://discord.gg/yB5tstRHrn)
-**Discord: <https://discord.gg/yB5tstRHrn>**
+[![Discord](https://img.shields.io/badge/Discord-join%20the%20server-5865F2?logo=discord&logoColor=white)](https://discord.gg/xcl)
+**Discord: <https://discord.gg/xcl>**
 
-XCL runs Xbox Series X|S (GDK) game files on a Windows PC **without CPU emulation**: the game's
-x64 code runs natively and XCL stands in for the console libraries the PC does not have
-(`kernelx.dll`, XGameRuntime, `d3d12_xs.dll`, …) – in the spirit of Wine/Proton. The console's
-GPU code (RDNA2 machine code) is recompiled into PC shaders (HLSL → DXIL).
+XCL is a compatibility layer that runs Xbox Series X|S (GDK) games you own on a Windows PC - in the spirit of Wine/Proton. There is no CPU emulation: the game's x64 code runs natively, and XCL provides its own, independently written implementations of the console system libraries the PC does not have (`kernelx.dll`, XGameRuntime, `d3d12_xs.dll`, …). The console's GPU code (RDNA2 machine code) is recompiled into PC shaders (HLSL → DXIL).
 
-**Project state:** retail games run – Minecraft Preview and Unicorn Overlord are fully
-playable, Fortnite and XDefiant work as far as each game goes without its online services;
-see [Games](#games). The foundation is tested against real data from retail games
-(shader packs, texture archives, movies and the console DLLs they ship). Details, measurements and
-next steps:
-[`HANDOFF.md`](HANDOFF.md); design: [`docs/specs/2026-11-20-xcl-design.md`](docs/specs/2026-11-20-xcl-design.md).
+XCL works only on unpacked game files you already own. It does not download, decrypt or unpack game packages (XVC / MSIXVC) and contains nothing for circumventing DRM. The repository holds no code, headers or binaries from the console SDK, no keys and no game data; the Windows components XCL relies on (XGameRuntime, XAudio2, D3D12, DXC) come from your own system or the public Windows SDK and are not distributed with XCL.
 
 ## Games
 
@@ -23,7 +15,7 @@ next steps:
 | **Unicorn Overlord** | `SEGAofAmericaInc.Pa253b0c1Y` 1.0.0.6 | ✅ | fully playable | – |
 | **Fortnite** | `436609B6.FortniteClient` 2.0.1461.7919 | ✅ | works fully, as far as the game allows without its online services | the game itself is online-only (multiplayer servers) |
 | **XDefiant** | `Ubisoft.XDefiant-Game` 1.0.0.186 | ✅ | works fully, as far as the game allows without its servers | the game's own servers have been shut down |
-| **A newer retail game** | – | 🚧 | starts in ~4 s, runs at a steady 30 fps without a crash and shows its first menu (the account prompt); fits a 32 GB machine (~19 GB committed) | further than its first menu not checked yet; its minimap mesh pipelines are refused |
+| **A newer retail game** | – | 🚧 | starts in ~4 s, runs at a steady 30 fps without a crash, shows its menus and goes on past the first one to its settings; fits a 32 GB machine (~15 GB committed in the menus) | gameplay not reached yet; its minimap mesh pipelines are refused |
 
 ## Highlights
 
@@ -49,6 +41,7 @@ next steps:
 | **kernelx** | ✅ | title memory (budget from MicrosoftGame.Config, physical pages), threads on the PC's processors, modules, OS / console info | unit + end-to-end tests |
 | **Memory** | ✅ | title graphics memory shared by CPU and GPU without copies, up to 16 GB (4 GiB windows) | GPU tests: loads, stores and atomics across windows |
 | **File system** | ✅ | console paths (`GAME:`, `G:`, `D:` …) → the game folder; writes go to an overlay, the game folder is never modified; the console's drives: `S:\` (persistent local storage) and `T:\` (temp) in the title's data folder; free disk space answered for console paths | end-to-end: the test title's folder stays byte-identical; PLS and free space through the real call path |
+| **DirectStorage** | ✅ | the console's DirectStorage queues: file and memory sources, zlib, and BCPack – the console's texture compression – for BC1, BC3, BC4, BC5, BC6H and BC7 (BC2 and the hardware swizzle are refused) | unit tests on synthetic streams; retail BCPack chunks of all six modes byte-identical with a reference decoder (`XCL_SAMPLE_BCPACK`) |
 
 ### System services
 
@@ -96,10 +89,17 @@ Windows 10/11 x64, Rust (`stable-x86_64-pc-windows-msvc`), the Windows SDK (DXC:
 `%XCL_DXC_DIR%`), a D3D12 GPU with Shader Model 6.6 and mesh shaders, and the system XGameRuntime
 (`System32\xgameruntime.dll`, part of Windows / Gaming Services). On **Windows 10** (22H2
 KB5029331+), inbox `D3D12Core.dll` stops at SM 6.5; place the Microsoft D3D12 Agility SDK
-(`D3D12Core.dll`, plus `d3d12SDKLayers.dll` if using `XCL_D3D12_DEBUG=1`) in `D3D12\` next to
-`xcl.exe`, next to `xcl.exe`, in `%LOCALAPPDATA%\XCL\D3D12\`, or point `%XCL_D3D12_DIR%` at it
+(`D3D12Core.dll`, plus `d3d12SDKLayers.dll` if using `XCL_D3D12_DEBUG=1`) in a `D3D12\` folder
+next to `xcl.exe`, directly next to `xcl.exe`, in `%LOCALAPPDATA%\XCL\D3D12\`, or point `%XCL_D3D12_DIR%` at it
 (for `cargo test`, use `%LOCALAPPDATA%\XCL\D3D12\` or `%XCL_D3D12_DIR%`).
 
+- **DXC:** 1.8 or newer is recommended, from the
+  [DirectXShaderCompiler releases](https://github.com/microsoft/DirectXShaderCompiler/releases): unpack one
+  and point `XCL_DXC_DIR` at its `bin\x64`. A Windows SDK may hold an older one (the same `10.0.26100.0`
+  folder has DXC 1.7.2308 or 1.8.2502, depending on the SDK's revision). DXC 1.7's DXIL was 2–2.7 times the
+  size of 1.9's for translated compute programs and took an NVIDIA driver 1.4–2.2 times as long to build
+  pipelines from ([#156](https://github.com/ivall/xcl/issues/156)). `xcl run` prints the DXC it loaded, and
+  `report.json` has it under `dxc`.
 - **GPU:** developed on AMD RDNA4. The console's geometry and NGG programs run as a compute pass plus a
   mesh pass, so a GPU without mesh shaders draws none of them. On GPUs with 32-lane waves only
   (NVIDIA) console wave64 compute, geometry and mesh programs run as two 32-lane halves that exchange
@@ -114,6 +114,7 @@ xcl inspect D:\Game\game.exe               # the game's imports and what XCL has
 xcl run D:\Game [-- game arguments]        # run
 xcl disasm <shader.bin> [--hex]            # RDNA2 disassembler (console containers too)
 xcl shaders D:\data\shaders.rpf --top 50   # pack statistics; --recomp / --compile N
+xcl shaders D:\data\shaders.rpf --precompile --only cs --pipelines   # build compute pipelines and save driver blobs for the next run
 xcl rpf D:\data\shaders.rpf --extract NAME --out folder
 ```
 
@@ -123,8 +124,20 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
 - XCL works on **unpacked** game files you own; it contains nothing for decrypting or
   circumventing DRM.
 - **The game folder is never modified** – writes go to the overlay.
+- Translated shaders are reused across XCL rebuilds when the translator sources and DXC
+  toolchain are unchanged; `XCL_TRANSLATED_CACHE=0` disables that disk cache.
+- With `XCL_DRED=1`, a D3D12 device removal logs GPU breadcrumbs in `xcl.log`.
+  XCL examines up to 4,096 command lists and reports up to 64 unfinished lists, starting with
+  those on which the GPU completed at least one operation.
 - Every run writes `report.json` (called stubs, unknown D3D12.X slots and interfaces, XGameRuntime
   classes asked for, shader statistics, audio formats, crash).
+  `d3d12.presents` counts presentations, not visible content. With `XCL_FRAME_DUMP=N` (`N > 1`),
+  the existing optional frame dumps also set `d3d12.last_frame_dump`: the latest sampled frame's
+  zero-based index, source dimensions, DXGI format, sample step, sample count and `non_dark_samples`
+  (decoded 8-bit R+G+B > 30). The field is `null` until a frame is sampled; `non_dark_samples` is
+  `null` if its format cannot be decoded. Intermediate render-target dumps do not update it.
+  Sampling uses every fourth pixel in each direction (`XCL_FRAME_DUMP_FULL=1`: every pixel).
+  A coarse sample can miss detail; a non-dark sample does not establish correct rendering or gameplay.
 - Title data: `%LOCALAPPDATA%\XCL\<title>\` (`%XCL_DATA_ROOT%`): `xcl.toml`, `overlay\`, `saves\`,
   `pls\` (the title's `S:\`), `temp\` (`T:\`), `cache\`, `logs\xcl.log`, `logs\report.json` (the
   previous run's: `xcl.prev.log`, `report.prev.json`).
@@ -143,7 +156,7 @@ the adapter (no GPU / DXC / wave64 / mesh shaders) passes too, but prints `SKIPP
 those skips fail. Tests on real game data are opt-in through
 environment variables pointing at your own files – `XCL_SAMPLE_RPF` (shader pack),
 `XCL_SAMPLE_DLLS` (the game's console DLLs), `XCL_SAMPLE_TTPF` (texture archive),
-`XCL_SAMPLE_BK2` (a movie), `XCL_SAMPLE_BVH4`, `XCL_SAMPLE_AWC` (a sound) – described in `HANDOFF.md`; without them those
+`XCL_SAMPLE_BCPACK` (a folder of BCPack streams `<name>.bc<mode>` with a reference decoder's blocks of each, `<name>.vic<mode>`), `XCL_SAMPLE_BK2` (a movie), `XCL_SAMPLE_BVH4`, `XCL_SAMPLE_AWC` (a sound) – described in `HANDOFF.md`; without them those
 tests pass without running anything (`scripts/test.ps1` lists the ones not set). No game data is
 part of the repository.
 

@@ -111,12 +111,13 @@ pub struct Texture {
 }
 
 /// (log2 bytes per element, pixels per element side) of a DXGI format; None for the 96-bit
-/// and packed 4:2:2 ones (not tiled) and unknown formats
+/// and packed 4:2:2 ones (not tiled) and unknown formats. The console's own 116 / 117
+/// (R10G10B10_7E3_A2_FLOAT / _6E4_A2_FLOAT) are 32 bits a pixel, like R10G10B10A2.
 pub fn element(f: u32) -> Option<(u32, u32)> {
     Some(match f {
         1..=4 => (4, 1),
         9..=22 => (3, 1),
-        23..=47 | 67 | 87..=93 => (2, 1),
+        23..=47 | 67 | 87..=93 | 116 | 117 => (2, 1),
         48..=59 | 85 | 86 | 115 => (1, 1),
         60..=65 => (0, 1),
         70..=72 | 79..=81 => (3, 4),
@@ -748,5 +749,41 @@ mod tests {
         assert_eq!(offsets, [0x20000, 0x10000, 0x8000, 0x4000, 0x2000, 0x1000, 0x800, 0x600, 0x500]);
         assert_eq!((mip(2, 0), mip(2, 9), mip(2, 10), mip(2, 18), mip(6, 9), mip(6, 10)), (0x8000, 0x40, 0x80, 1, 8, 8));
         assert_eq!(optimal_mode(0, 0, 32, 256, 256), 5);
+    }
+
+    fn usages_and_bytes(t: &Texture) -> Vec<(u32, u32)> {
+        t.planes.iter().map(|p| (p.usage, if let PlaneKind::Surface(s) = &p.kind { s.bpe } else { 0 })).collect()
+    }
+
+    /// The console's D16_UNORM_S8_UINT (118): a 2-byte depth plane and a 1-byte stencil plane,
+    /// after the HTILE in a depth buffer – a real size, which the PC's allocation info had not
+    /// (u64::MAX, and the title stopped on its assertion).
+    #[test]
+    fn d16s8_is_planar_depth_and_stencil() {
+        let mut x = desc(1920, 1080, 1, 1, 118, 0);
+        x[0x30..0x34].copy_from_slice(&2u32.to_le_bytes()); // ALLOW_DEPTH_STENCIL
+        let t = Texture::new(&x).unwrap();
+        assert_eq!(usages_and_bytes(&t), [(4, 0), (7, 2), (8, 1)]);
+        let end = t.planes.iter().map(|p| p.offset + p.bytes()).max().unwrap();
+        assert!(t.planes.windows(2).all(|w| w[0].offset + w[0].bytes() <= w[1].offset));
+        assert_eq!(t.size(), end);
+        assert!(t.size() >= 1920 * 1080 * 3 && t.size() < 1920 * 1080 * 8, "{:#x}", t.size());
+        assert_eq!(t.alignment(), 0x1_0000);
+        // the same format, not a depth buffer: depth and stencil planes only
+        let t = Texture::new(&desc(512, 512, 1, 1, 118, 0)).unwrap();
+        assert_eq!(usages_and_bytes(&t), [(5, 2), (6, 1)]);
+        assert!(t.size() >= 512 * 512 * 3 && t.size() != u64::MAX);
+    }
+
+    /// The console's R10G10B10_7E3_A2_FLOAT / _6E4_A2_FLOAT (116 / 117): 32 bits a pixel, laid
+    /// out as R10G10B10A2 (24).
+    #[test]
+    fn console_floats_are_32_bits() {
+        let rgb10a2 = Texture::new(&desc(1920, 1080, 1, 1, 24, 0)).unwrap();
+        for f in [116, 117] {
+            let t = Texture::new(&desc(1920, 1080, 1, 1, f, 0)).unwrap();
+            assert_eq!(usages_and_bytes(&t), [(1, 4)]);
+            assert_eq!((t.size(), t.alignment()), (rgb10a2.size(), rgb10a2.alignment()));
+        }
     }
 }

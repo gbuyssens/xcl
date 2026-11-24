@@ -73,9 +73,45 @@ pub fn fspx(blob: &[u8]) -> Option<Fspx<'_>> {
     Some(Fspx { threads, rsrc1: u32_at(head, 0x14)?, rsrc2: u32_at(head, 0x18)?, code: &code[..4 * (end + 1)] })
 }
 
-/// Memory windows of the title's unified memory (1 without it).
+/// Memory windows of the title's unified memory (1 without it), with `HEAP_WINDOWS` when
+/// shaders take them from the descriptor heap (`heap_windows`).
 pub fn mem_windows() -> u32 {
-    crate::gpu::uma::get().map_or(1, |u| u.shader_windows() as u32)
+    let n = crate::gpu::uma::get().map_or(1, |u| u.shader_windows() as u32);
+    if n > 1 && heap_windows() && !SWITCH_FORM.with(|s| s.get()) {
+        n | super::HEAP_WINDOWS
+    } else {
+        n
+    }
+}
+
+thread_local! {
+    /// this thread translates in the switch form (`in_switch_form`)
+    static SWITCH_FORM: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Run `f` with this thread's translations in the switch form over root UAVs (`mem_windows`
+/// without `HEAP_WINDOWS`, so other cache keys): for a pipeline the driver would not build with
+/// heap windows. The root signature and the binds are the same for both forms.
+pub fn in_switch_form<R>(f: impl FnOnce() -> R) -> R {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            SWITCH_FORM.with(|s| s.set(self.0));
+        }
+    }
+    let _restore = Restore(SWITCH_FORM.with(|s| s.replace(true)));
+    f()
+}
+
+/// Whether translated shaders reach the memory windows through the shared descriptor heap
+/// (`Options::heap_windows`; descriptors `MEM_HEAP_BASE`.. made by `console_heap::set_window_views`)
+/// instead of a `switch` over root UAVs. Opt-in: on with `XCL_HEAP_WINDOWS=1`, unless the views
+/// could not be made (no shared heap: then the switch, as before). Off by default: two NVIDIA
+/// setups failed with it (the driver's compiler ending the process; a device removal when the
+/// views are made on an 8 GB card) that other machines do not show.
+pub fn heap_windows() -> bool {
+    static ENV: OnceLock<bool> = OnceLock::new();
+    *ENV.get_or_init(|| std::env::var("XCL_HEAP_WINDOWS").is_ok_and(|v| v.trim() == "1")) && !crate::hle::d3d12x::console_heap::window_views_failed()
 }
 
 /// A static sampler of a translated program: (S#, comparison) – see `Translation`.
@@ -129,23 +165,35 @@ pub fn console_to_dxil_in(blob: &[u8], stage: Stage, sampler_base: u32, split_wa
 /// cache is keyed by the generated HLSL, so it needs the translation first: a retail game's
 /// ~2 800 programs (611 of more than 10 000 instructions) took its loading threads 0.1 - 0.3 s
 /// each at every start. Keyed by two hashes and the length of the bytes, the stage and the
-/// translation parameters; the XCL binary's hash is in each file (another build: a miss).
+/// translation parameters; translator sources and the DXC toolchain identify compatible builds.
 /// `XCL_TRANSLATED_CACHE=0` turns it off.
 mod translated {
     use super::{Compiled, Stage};
     use std::path::{Path, PathBuf};
     use std::sync::OnceLock;
 
-    const MAGIC: &[u8; 8] = b"XCLTRAN1";
+    const MAGIC: &[u8; 8] = b"XCLTRAN2";
 
-    /// the running XCL binary's hash (0: unknown – the disk is not used)
+    pub(super) fn identity_for(source: &str, toolchain: &str) -> u64 {
+        let mut h = 0xcbf2_9ce4_8422_2325u64;
+        for part in ["xcl-translated-cache-v2", source, toolchain] {
+            for byte in part.bytes().chain([0]) {
+                h ^= byte as u64;
+                h = h.wrapping_mul(0x100_0000_01b3);
+            }
+        }
+        h | 1
+    }
+
+    /// Translation semantics and the DXC DLLs, independent of link metadata and build profile.
+    /// Zero means the disk cache is disabled.
     fn identity() -> u64 {
         static I: OnceLock<u64> = OnceLock::new();
         *I.get_or_init(|| {
             if std::env::var("XCL_TRANSLATED_CACHE").is_ok_and(|v| v == "0") {
                 return 0;
             }
-            std::env::current_exe().and_then(std::fs::read).map_or(0, |b| crate::gpu::shader::fnv64(&b) | 1)
+            identity_for(env!("XCL_TRANSLATOR_SOURCE_ID"), super::dxc::toolchain_identity())
         })
     }
 
@@ -154,8 +202,11 @@ mod translated {
         b.iter().fold(0x9E37_79B9_7F4A_7C15u64, |h, &x| (h ^ x as u64).wrapping_mul(0xFF51_AFD7_ED55_8CCD).rotate_left(29))
     }
 
-    fn file(dir: &Path, blob: &[u8], stage: Stage, sampler_base: u32, windows: u32, split: bool) -> PathBuf {
-        dir.join("translated").join(format!("{:016x}_{stage:?}_{sampler_base}_{windows}_{}.bin", crate::gpu::shader::fnv64(blob), split as u8))
+    pub(super) fn file(dir: &Path, ident: u64, blob: &[u8], stage: Stage, sampler_base: u32, windows: u32, split: bool) -> PathBuf {
+        dir.join("translated")
+            .join("v2")
+            .join(format!("{ident:016x}"))
+            .join(format!("{:016x}_{stage:?}_{sampler_base}_{windows}_{}.bin", crate::gpu::shader::fnv64(blob), split as u8))
     }
 
     fn header(ident: u64, blob: &[u8]) -> Vec<u8> {
@@ -204,7 +255,30 @@ mod translated {
         }
     }
 
-    /// `translate` through the disk (`ident` 0: not used)
+    pub(super) fn cached_in(
+        dir: &Path,
+        ident: u64,
+        blob: &[u8],
+        stage: Stage,
+        sampler_base: u32,
+        windows: u32,
+        split: bool,
+        translate: impl FnOnce() -> Result<Compiled, String>,
+    ) -> Result<Compiled, String> {
+        if ident == 0 {
+            return translate();
+        }
+        let path = file(dir, ident, blob, stage, sampler_base, windows, split);
+        if let Some(c) = load_in(&path, ident, blob) {
+            super::dxc::note_memory_hit();
+            return Ok(c);
+        }
+        let c = translate()?;
+        store_in(&path, ident, blob, &c);
+        Ok(c)
+    }
+
+    /// `translate` through the disk (`identity()` zero: not used).
     pub(super) fn cached(
         dir: &Path,
         blob: &[u8],
@@ -214,21 +288,12 @@ mod translated {
         split: bool,
         translate: impl FnOnce() -> Result<Compiled, String>,
     ) -> Result<Compiled, String> {
-        let ident = identity();
-        if ident == 0 {
-            return translate();
-        }
-        let path = file(dir, blob, stage, sampler_base, windows, split);
-        if let Some(c) = load_in(&path, ident, blob) {
-            super::dxc::note_memory_hit();
-            return Ok(c);
-        }
-        let c = translate()?;
-        store_in(&path, ident, blob, &c);
-        Ok(c)
+        cached_in(dir, identity(), blob, stage, sampler_base, windows, split, translate)
     }
 }
 
+// Changes here, in `fspx`, or in `console_translation` that alter the cached result must bump
+// `TRANSLATION_GLUE_REVISION` in build.rs; cache serialization changes need not bump it.
 fn compile_console_shader(blob: &[u8], stage: Stage, sampler_base: u32, windows: u32, split_wave64: bool) -> Result<Compiled, String> {
     let (mut t, profile) = console_translation(blob, stage, sampler_base, windows, split_wave64)?;
     if let Some([r, g, b]) = (stage == Stage::Pixel).then(|| debug_color(blob)).flatten() {
@@ -417,7 +482,7 @@ fn cached_shader(
 }
 
 fn cache_allowed(stage: Stage, present: impl Fn(&str) -> bool) -> bool {
-    !["XCL_RECOMP_NO_STRUCTURED", "XCL_RECOMP_WHY"]
+    !["XCL_RECOMP_NO_STRUCTURED", "XCL_RECOMP_WHY", "XCL_X64_ALL_MASKS", "XCL_WAVE64_SPIN"]
         .iter()
         .any(|name| present(name))
         && (stage != Stage::Pixel
@@ -431,19 +496,27 @@ fn cache_allowed(stage: Stage, present: impl Fn(&str) -> bool) -> bool {
             .any(|name| present(name)))
 }
 
+/// User SGPRs of a console compute shader (COMPUTE_PGM_RSRC2 in FSPX or FSSM):
+/// s0…s3 are the driver's, so what is above 4 is the root arguments its compiler passed in
+/// registers. None: not a console compute shader.
+pub fn compute_user_sgprs(blob: &[u8]) -> Option<u32> {
+    if let Some(f) = fspx(blob) {
+        return Some(super::CsInterface::from_rsrc2(f.threads, f.rsrc2).user_sgprs);
+    }
+    let sh = xbox::parse(blob)?;
+    let f = sh.fssm.iter().find(|f| f.stages.first().is_some_and(|s| s.hw == 6))?;
+    match interface(blob, &sh, f)? {
+        Mode::Compute(cs) => Some(cs.user_sgprs),
+        _ => None,
+    }
+}
+
 fn console_translation(blob: &[u8], stage: Stage, sampler_base: u32, windows: u32, split_wave64: bool) -> Result<(super::Translation, &'static str), String> {
     if let Some(f) = fspx(blob) {
         if stage != Stage::Compute {
             return Err("an FSPX (driver) container in a graphics slot".into());
         }
-        let r = f.rsrc2;
-        let cs = super::CsInterface {
-            threads: f.threads,
-            user_sgprs: (r >> 1) & 31,
-            tgid: [(r >> 7) & 1 == 1, (r >> 8) & 1 == 1, (r >> 9) & 1 == 1],
-            tg_size: (r >> 10) & 1 == 1,
-            tid_components: ((r >> 11) & 3) + 1,
-        };
+        let cs = super::CsInterface::from_rsrc2(f.threads, f.rsrc2);
         let t = translate(f.code, &Options { mode: Mode::Compute(cs), wave64: super::detect_wave64(f.code), split_wave64, static_sampler_base: sampler_base, mem_windows: windows, ..Default::default() })?;
         if !t.complete() {
             let missing: Vec<&String> = t.unsupported.keys().collect();
@@ -573,6 +646,17 @@ pub fn console_geometry(vs: &[u8], gs: &[u8], ps: Option<&[u8]>, split_wave64: b
     finish_two_pass(translation, record, ps)
 }
 
+/// The geometry shader (gs_6_6 DXIL) that draws a console rect list's rectangles behind the
+/// console VS `vs` (its container): `emit::rect_list_gs` for the VS's output signature, which
+/// is what the translated VS's output struct is declared from.
+pub fn rect_list_gs(vs: &[u8]) -> Result<Vec<u8>, String> {
+    let outputs = crate::gpu::dxbc::signatures(vs).1;
+    if outputs.is_empty() {
+        return Err("the VS has no output signature".into());
+    }
+    Ok(dxc::compile_cached(&super::emit::rect_list_gs(&outputs), "main", "gs_6_6")?.0)
+}
+
 /// XCL shader ABI root signature (see the module docs); `graphics` allows an input layout.
 pub fn abi_root_signature(dev: &ID3D12Device, graphics: bool) -> Result<ID3D12RootSignature, String> {
     abi_root_signature_with(dev, graphics, &[])
@@ -645,21 +729,78 @@ pub fn abi_root_signature_with(dev: &ID3D12Device, graphics: bool, samplers: &[S
 mod shader_cache_tests {
     use super::*;
 
-    /// A translation on disk comes back for the same bytes and build only: other bytes of the
-    /// same length, another build or a cut file are misses.
     #[test]
-    fn translations_on_disk_need_the_same_bytes_and_build() {
+    fn translated_identity_tracks_sources_and_dxc() {
+        let built_source = env!("XCL_TRANSLATOR_SOURCE_ID");
+        assert_eq!(built_source.len(), 16);
+        assert!(u64::from_str_radix(built_source, 16).is_ok());
+        let a = translated::identity_for("source-a", "dxc-a");
+        assert_ne!(a, 0);
+        assert_eq!(a, translated::identity_for("source-a", "dxc-a"));
+        assert_ne!(a, translated::identity_for("source-b", "dxc-a"));
+        assert_ne!(a, translated::identity_for("source-a", "dxc-b"));
+    }
+
+    #[test]
+    fn translated_namespace_tracks_every_request_input() {
+        let dir = PathBuf::from("cache");
+        let base = translated::file(&dir, 42, b"console", Stage::Compute, 3, 2, false);
+        let paths = [
+            base.clone(),
+            translated::file(&dir, 43, b"console", Stage::Compute, 3, 2, false),
+            translated::file(&dir, 42, b"consolf", Stage::Compute, 3, 2, false),
+            translated::file(&dir, 42, b"console", Stage::Vertex, 3, 2, false),
+            translated::file(&dir, 42, b"console", Stage::Compute, 4, 2, false),
+            translated::file(&dir, 42, b"console", Stage::Compute, 3, 3, false),
+            translated::file(&dir, 42, b"console", Stage::Compute, 3, 2, true),
+        ];
+        assert_eq!(paths.iter().collect::<std::collections::HashSet<_>>().len(), paths.len());
+        assert!(base.starts_with(dir.join("translated").join("v2").join("000000000000002a")));
+    }
+
+    /// A translation on disk comes back for the same bytes and semantic identity only: other
+    /// bytes of the same length, another translator/toolchain or a cut file are misses.
+    #[test]
+    fn translations_on_disk_need_the_same_bytes_and_identity() {
         let dir = std::env::temp_dir().join(format!("xcl-translated-{}", std::process::id()));
         let path = dir.join("t.bin");
         let c = Compiled { dxil: vec![1, 2, 3, 4, 5], samplers: vec![([7, 8, 9, 10], true), ([1, 2, 3, 4], false)] };
         translated::store_in(&path, 42, b"console", &c);
         let back = translated::load_in(&path, 42, b"console").expect("stored");
         assert_eq!((back.dxil, back.samplers), (c.dxil.clone(), c.samplers.clone()));
-        assert!(translated::load_in(&path, 43, b"console").is_none(), "another build");
+        assert!(translated::load_in(&path, 43, b"console").is_none(), "another identity");
         assert!(translated::load_in(&path, 42, b"consolf").is_none(), "other bytes");
         let full = std::fs::read(&path).unwrap();
         std::fs::write(&path, &full[..full.len() - 1]).unwrap();
         assert!(translated::load_in(&path, 42, b"console").is_none(), "a cut file");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn translated_v2_ignores_valid_entries_outside_its_namespace() {
+        let dir = std::env::temp_dir().join(format!("xcl-translated-legacy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let blob = b"console";
+        let ident = 42;
+        let unnamespaced = dir.join("translated").join(format!("{:016x}_Compute_0_1_0.bin", crate::gpu::shader::fnv64(blob)));
+        // Use a valid v2 payload so the miss proves the namespace, rather than header parsing,
+        // kept the old root-level location out of consideration.
+        let old = compiled(3);
+        translated::store_in(&unnamespaced, ident, blob, &old);
+
+        let mut calls = 0;
+        let first = translated::cached_in(&dir, ident, blob, Stage::Compute, 0, 1, false, || {
+            calls += 1;
+            Ok(compiled(7))
+        })
+        .unwrap();
+        assert_eq!(calls, 1);
+        assert_eq!(first.dxil[0], 7);
+        assert!(unnamespaced.exists());
+        assert!(translated::file(&dir, ident, blob, Stage::Compute, 0, 1, false).exists());
+
+        let second = translated::cached_in(&dir, ident, blob, Stage::Compute, 0, 1, false, || panic!("v2 entry was not reused")).unwrap();
+        assert_eq!(second.dxil, first.dxil);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -800,7 +941,7 @@ mod shader_cache_tests {
 
     #[test]
     fn shader_cache_bypasses_debug_overrides() {
-        for name in ["XCL_RECOMP_NO_STRUCTURED", "XCL_RECOMP_WHY"] {
+        for name in ["XCL_RECOMP_NO_STRUCTURED", "XCL_RECOMP_WHY", "XCL_X64_ALL_MASKS", "XCL_WAVE64_SPIN"] {
             assert!(!cache_allowed(Stage::Compute, |v| v == name));
             assert!(!cache_allowed(Stage::Vertex, |v| v == name));
             assert!(!cache_allowed(Stage::Pixel, |v| v == name));

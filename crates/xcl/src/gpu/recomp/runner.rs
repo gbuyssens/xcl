@@ -631,6 +631,76 @@ pub fn draw(
     size: u32,
     clear: [f32; 4],
 ) -> Result<Vec<[f32; 4]>, String> {
+    draw_gs(vs, None, ps, layout, vertices, stride, sgprs, mem, size, clear)
+}
+
+/// `draw` with a geometry shader (DXIL) between the VS and the PS.
+#[allow(clippy::too_many_arguments)]
+pub fn draw_gs(
+    vs: &[u8],
+    gs: Option<&[u8]>,
+    ps: &[u8],
+    layout: &[VertexElement],
+    vertices: &[f32],
+    stride: u32,
+    sgprs: &[u32],
+    mem: &[u32],
+    size: u32,
+    clear: [f32; 4],
+) -> Result<Vec<[f32; 4]>, String> {
+    draw_gs_views(vs, gs, ps, layout, vertices, stride, &[], sgprs, mem, &[], &[], size, clear)
+}
+
+/// `draw_gs` of an indexed triangle list (`indices`).
+#[allow(clippy::too_many_arguments)]
+pub fn draw_gs_indexed(
+    vs: &[u8],
+    gs: Option<&[u8]>,
+    ps: &[u8],
+    layout: &[VertexElement],
+    vertices: &[f32],
+    stride: u32,
+    indices: &[u32],
+    size: u32,
+    clear: [f32; 4],
+) -> Result<Vec<[f32; 4]>, String> {
+    draw_gs_views(vs, gs, ps, layout, vertices, stride, indices, &[], &[], &[], &[], size, clear)
+}
+
+/// `draw` with textures and samplers in the directly indexed heaps (see `ViewTexture`).
+#[allow(clippy::too_many_arguments)]
+pub fn draw_views(
+    vs: &[u8],
+    ps: &[u8],
+    layout: &[VertexElement],
+    vertices: &[f32],
+    stride: u32,
+    sgprs: &[u32],
+    mem: &[u32],
+    textures: &[ViewTexture],
+    samplers: &[D3D12_SAMPLER_DESC],
+    size: u32,
+    clear: [f32; 4],
+) -> Result<Vec<[f32; 4]>, String> {
+    draw_gs_views(vs, None, ps, layout, vertices, stride, &[], sgprs, mem, textures, samplers, size, clear)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_gs_views(
+    vs: &[u8],
+    gs: Option<&[u8]>,
+    ps: &[u8],
+    layout: &[VertexElement],
+    vertices: &[f32],
+    stride: u32,
+    indices: &[u32],
+    sgprs: &[u32],
+    mem: &[u32],
+    textures: &[ViewTexture],
+    samplers: &[D3D12_SAMPLER_DESC],
+    size: u32,
+    clear: [f32; 4],
+) -> Result<Vec<[f32; 4]>, String> {
     let mut g = GPU.lock().unwrap();
     let gpu = g.get_or_insert_with(init).as_mut().map_err(|x| x.clone())?;
     unsafe {
@@ -654,6 +724,7 @@ pub fn draw(
             pRootSignature: transmute_copy(&rs),
             VS: D3D12_SHADER_BYTECODE { pShaderBytecode: vs.as_ptr() as _, BytecodeLength: vs.len() },
             PS: D3D12_SHADER_BYTECODE { pShaderBytecode: ps.as_ptr() as _, BytecodeLength: ps.len() },
+            GS: gs.map_or_else(D3D12_SHADER_BYTECODE::default, |g| D3D12_SHADER_BYTECODE { pShaderBytecode: g.as_ptr() as _, BytecodeLength: g.len() }),
             SampleMask: u32::MAX,
             InputLayout: D3D12_INPUT_LAYOUT_DESC { pInputElementDescs: elems.as_ptr(), NumElements: elems.len() as u32 },
             PrimitiveTopologyType: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
@@ -667,7 +738,8 @@ pub fn draw(
         pd.RasterizerState.DepthClipEnable = true.into();
         pd.RTVFormats[0] = DXGI_FORMAT_R32G32B32A32_FLOAT;
         let pso: ID3D12PipelineState = dev.CreateGraphicsPipelineState(&pd).map_err(|x| format!("CreateGraphicsPipelineState: {x}"))?;
-        draw_on(dev, &pso, &rs, vertices, stride, sgprs, mem, size, clear)
+        let draw = Draw { sgprs: sgprs.to_vec(), scissor: [0, 0, size as i32, size as i32] };
+        draw_indexed_on(dev, &pso, &rs, vertices, stride, indices, &[draw], mem, textures, samplers, size, clear)
     }
 }
 
@@ -692,7 +764,8 @@ pub fn draw_on(
 }
 
 /// A texture in D3D12 terms (e.g. decoded from a console T# by `gpu::desc`): SRV at
-/// descriptor heap index 2·i; `data` = subresource 0, rows of `row_bytes` tightly packed.
+/// descriptor heap index 2·i; `data` = the `MipLevels` levels one after the other, each in
+/// tightly packed rows (`row_bytes` for level 0, its width's share for the smaller ones).
 pub struct ViewTexture {
     pub res: D3D12_RESOURCE_DESC,
     pub srv: D3D12_SHADER_RESOURCE_VIEW_DESC,
@@ -733,25 +806,34 @@ unsafe fn bind_views(dev: &ID3D12Device, list: &ID3D12GraphicsCommandList, textu
     }
     let mut keep: Vec<windows::core::IUnknown> = vec![heap.cast().map_err(e)?, sheap.cast().map_err(e)?];
     for (i, t) in textures.iter().enumerate() {
-        let mut fp = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
-        let (mut rows, mut total) = (0u32, 0u64);
-        dev.GetCopyableFootprints(&t.res, 0, 1, 0, Some(&mut fp), Some(&mut rows), None, Some(&mut total));
+        let levels = t.res.MipLevels.max(1) as usize;
+        let mut fps = vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); levels];
+        let (mut rows, mut total) = (vec![0u32; levels], 0u64);
+        dev.GetCopyableFootprints(&t.res, 0, levels as u32, 0, Some(fps.as_mut_ptr()), Some(rows.as_mut_ptr()), None, Some(&mut total));
         let up = buffer(dev, total, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ, false)?;
         let mut p = std::ptr::null_mut();
         up.Map(0, None, Some(&mut p)).map_err(e)?;
-        for y in 0..rows as usize {
-            if let Some(src) = t.data.get(y * t.row_bytes..(y + 1) * t.row_bytes) {
-                std::ptr::copy_nonoverlapping(src.as_ptr(), (p as *mut u8).add(fp.Offset as usize + y * fp.Footprint.RowPitch as usize), t.row_bytes);
+        let texel = t.row_bytes / (t.res.Width as usize).max(1);
+        let mut offset = 0usize;
+        for (k, fp) in fps.iter().enumerate() {
+            let row_bytes = ((t.res.Width as usize) >> k).max(1) * texel;
+            for y in 0..rows[k] as usize {
+                if let Some(src) = t.data.get(offset + y * row_bytes..offset + (y + 1) * row_bytes) {
+                    std::ptr::copy_nonoverlapping(src.as_ptr(), (p as *mut u8).add(fp.Offset as usize + y * fp.Footprint.RowPitch as usize), row_bytes);
+                }
             }
+            offset += rows[k] as usize * row_bytes;
         }
         up.Unmap(0, None);
         let mut r: Option<ID3D12Resource> = None;
         dev.CreateCommittedResource(&D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() }, D3D12_HEAP_FLAG_NONE, &t.res, D3D12_RESOURCE_STATE_COPY_DEST, None, &mut r)
             .map_err(|x| format!("texture {i}: {x}"))?;
         let r = r.ok_or("texture")?;
-        let dst = D3D12_TEXTURE_COPY_LOCATION { pResource: transmute_copy(&r), Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 } };
-        let src = D3D12_TEXTURE_COPY_LOCATION { pResource: transmute_copy(&up), Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: fp } };
-        list.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
+        for (k, fp) in fps.iter().enumerate() {
+            let dst = D3D12_TEXTURE_COPY_LOCATION { pResource: transmute_copy(&r), Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: k as u32 } };
+            let src = D3D12_TEXTURE_COPY_LOCATION { pResource: transmute_copy(&up), Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: *fp } };
+            list.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
+        }
         list.ResourceBarrier(&[transition(&r, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE)]);
         dev.CreateShaderResourceView(&r, Some(&t.srv), at(&heap, 2 * i, inc));
         keep.push(r.cast().map_err(e)?);
@@ -771,6 +853,25 @@ pub fn draw_on_multi(
     rs: &ID3D12RootSignature,
     vertices: &[f32],
     stride: u32,
+    draws: &[Draw],
+    mem: &[u32],
+    textures: &[ViewTexture],
+    samplers: &[D3D12_SAMPLER_DESC],
+    size: u32,
+    clear: [f32; 4],
+) -> Result<Vec<[f32; 4]>, String> {
+    draw_indexed_on(dev, pso, rs, vertices, stride, &[], draws, mem, textures, samplers, size, clear)
+}
+
+/// `draw_on_multi`, the draws indexed when there are `indices` (one index buffer for all).
+#[allow(clippy::too_many_arguments)]
+fn draw_indexed_on(
+    dev: &ID3D12Device,
+    pso: &ID3D12PipelineState,
+    rs: &ID3D12RootSignature,
+    vertices: &[f32],
+    stride: u32,
+    indices: &[u32],
     draws: &[Draw],
     mem: &[u32],
     textures: &[ViewTexture],
@@ -863,11 +964,27 @@ pub fn draw_on_multi(
         list.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         let vbv = D3D12_VERTEX_BUFFER_VIEW { BufferLocation: upload.GetGPUVirtualAddress(), SizeInBytes: vb_bytes as u32, StrideInBytes: stride };
         list.IASetVertexBuffers(0, Some(&[vbv]));
+        let _index_buf = if indices.is_empty() {
+            None
+        } else {
+            let bytes = (indices.len() * 4) as u64;
+            let b = buffer(dev, bytes, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ, false)?;
+            let mut p = std::ptr::null_mut();
+            b.Map(0, None, Some(&mut p)).map_err(e)?;
+            std::ptr::copy_nonoverlapping(indices.as_ptr(), p as *mut u32, indices.len());
+            b.Unmap(0, None);
+            list.IASetIndexBuffer(Some(&D3D12_INDEX_BUFFER_VIEW { BufferLocation: b.GetGPUVirtualAddress(), SizeInBytes: bytes as u32, Format: DXGI_FORMAT_R32_UINT }));
+            Some(b)
+        };
         for (k, d) in draws.iter().enumerate() {
             list.SetGraphicsRootUnorderedAccessView(0, io_buf.GetGPUVirtualAddress() + (k * KERNEL_SGPRS * 4) as u64);
             let [left, top, right, bottom] = d.scissor;
             list.RSSetScissorRects(&[windows::Win32::Foundation::RECT { left, top, right, bottom }]);
-            list.DrawInstanced((vertices.len() as u32 * 4) / stride, 1, 0, 0);
+            if indices.is_empty() {
+                list.DrawInstanced((vertices.len() as u32 * 4) / stride, 1, 0, 0);
+            } else {
+                list.DrawIndexedInstanced(indices.len() as u32, 1, 0, 0, 0);
+            }
         }
         list.ResourceBarrier(&[transition(&rt, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
         let dst = D3D12_TEXTURE_COPY_LOCATION {
@@ -1128,6 +1245,9 @@ fn run_in_region(dxil: &[u8], state: &KernelState, arena: &Arena) -> Result<Kern
     let mut io: Vec<u32> = state.sgpr.clone();
     io.resize(KERNEL_SGPRS, 0);
     io[KERNEL_SCC_SLOT] = state.scc;
+    if let Some(&(base, _)) = arena.windows.first() {
+        io[super::IO_UMA_BASE_HI] = ((base as usize) >> 32) as u32;
+    }
     for lane in 0..KERNEL_LANES {
         let mut regs = state.vgpr.get(lane).cloned().unwrap_or_default();
         regs.resize(KERNEL_VGPRS, 0);
@@ -1183,6 +1303,24 @@ fn run_in_region(dxil: &[u8], state: &KernelState, arena: &Arena) -> Result<Kern
         for b in &bufs[1..] {
             list.ResourceBarrier(&[transition(b, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)]);
         }
+        // the windows as raw UAVs at MEM_HEAP_BASE.. of a shader-visible heap
+        // (`Options::heap_windows`; programs with the root-UAV switch ignore it)
+        let dh: ID3D12DescriptorHeap = dev
+            .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                NumDescriptors: super::MEM_HEAP_BASE + 4,
+                Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                NodeMask: 0,
+            })
+            .map_err(e)?;
+        let inc = dev.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) as usize;
+        for k in 0..4usize {
+            let (b, size) = bufs.get(k).map_or((&mem_buf, arena.windows[0].1), |b| (b, arena.windows[k].1));
+            let mut h = dh.GetCPUDescriptorHandleForHeapStart();
+            h.ptr += (super::MEM_HEAP_BASE as usize + k) * inc;
+            dev.CreateUnorderedAccessView(b, None::<&ID3D12Resource>, Some(&raw_window_uav(size as u64)), h);
+        }
+        list.SetDescriptorHeaps(&[Some(dh.clone())]);
         list.SetComputeRootSignature(&gpu.rs);
         list.SetComputeRootUnorderedAccessView(0, io_buf.GetGPUVirtualAddress());
         list.SetComputeRootUnorderedAccessView(1, res_buf.GetGPUVirtualAddress());
@@ -1209,6 +1347,24 @@ fn run_in_region(dxil: &[u8], state: &KernelState, arena: &Arena) -> Result<Kern
         let vgpr = (0..KERNEL_LANES).map(|l| raw[KERNEL_SGPRS + l * KERNEL_VGPRS..KERNEL_SGPRS + (l + 1) * KERNEL_VGPRS].to_vec()).collect();
         split_halves_agree(&raw)?;
         Ok(KernelResult { sgpr: raw[..KERNEL_SGPRS].to_vec(), vgpr, scc: raw[KERNEL_SCC_SLOT], raw, mem: Vec::new(), textures: Vec::new() })
+    }
+}
+
+/// A raw UAV of a memory window of `bytes` (`Options::heap_windows`): at most 4 GiB − 32 bytes.
+/// An older D3D12 runtime (the one in Windows 11 23H2, D3D12Core 10.0.22621) refuses a raw view
+/// that ends above that from the start of its resource and removes the device; newer ones take
+/// 2^30 − 1 dwords (measured by CharlyRien on PR #680). The sparse windows hand out their last
+/// 64 KiB tile – a view of 4 GiB − 64 KiB left it unreachable (zeros, dropped stores); this one
+/// misses only the window's last 32 bytes
+/// (`heap_window_tests::gpu_raw_window_view_reaches_its_top`).
+pub fn raw_window_uav(bytes: u64) -> D3D12_UNORDERED_ACCESS_VIEW_DESC {
+    let bytes = bytes.min((1u64 << 32) - 32);
+    D3D12_UNORDERED_ACCESS_VIEW_DESC {
+        Format: DXGI_FORMAT_R32_TYPELESS,
+        ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+        Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+            Buffer: D3D12_BUFFER_UAV { FirstElement: 0, NumElements: (bytes / 4) as u32, StructureByteStride: 0, CounterOffsetInBytes: 0, Flags: D3D12_BUFFER_UAV_FLAG_RAW },
+        },
     }
 }
 
@@ -1308,7 +1464,25 @@ fn dispatch_with(
             transition(&mem_buf, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
             transition(&res_buf, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
         ]);
-        let _bound = bind_resources(dev, &list, &[], &[])?;
+        let bound = bind_resources(dev, &list, &[], &[])?;
+        // A PSO built by the backend's hook uses the runtime's window count: with heap windows
+        // (`Options::heap_windows`) its accesses go to ResourceDescriptorHeap[MEM_HEAP_BASE + w],
+        // so every window slot is a raw view of `mem` (no textures here to share the heap with).
+        let dh: ID3D12DescriptorHeap = dev
+            .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                NumDescriptors: super::MEM_HEAP_BASE + 4,
+                Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                NodeMask: 0,
+            })
+            .map_err(e)?;
+        let inc = dev.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) as usize;
+        for k in 0..4usize {
+            let mut h = dh.GetCPUDescriptorHandleForHeapStart();
+            h.ptr += (super::MEM_HEAP_BASE as usize + k) * inc;
+            dev.CreateUnorderedAccessView(&mem_buf, None::<&ID3D12Resource>, Some(&raw_window_uav(mem_bytes)), h);
+        }
+        list.SetDescriptorHeaps(&[Some(dh.clone()), Some(bound._heaps[1].clone())]);
         list.SetComputeRootSignature(rs);
         list.SetComputeRootUnorderedAccessView(0, io_buf.GetGPUVirtualAddress());
         list.SetComputeRootUnorderedAccessView(1, res_buf.GetGPUVirtualAddress());

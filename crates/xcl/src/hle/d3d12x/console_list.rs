@@ -83,6 +83,11 @@ const INLINE_SGPRS: u32 = 12;
 const INLINE_SGPRS_GFX: u32 = 24;
 const FIRST_SGPR: usize = 4;
 const FIRST_SGPR_GFX: usize = 8;
+/// Most bytes of root arguments a layout has. The PC's limit is 64 DWORDs (256 bytes: a
+/// constant or a table 1, a root descriptor 2, D3D12 "Root Signature Limits"); the console's
+/// is not known, so 16 times that. A malformed blob (a count of 0x3FFF_FFFF constants) gets no
+/// layout instead of one of gigabytes, which every Set*RootSignature allocates.
+const MAX_ARGS: u32 = 4096;
 
 /// Layout from a serialized root signature: a DXBC container with RTS0 or a bare RTS0.
 pub fn layout_from_blob(blob: &[u8]) -> Option<Layout> {
@@ -108,10 +113,12 @@ pub fn layout_from_blob(blob: &[u8]) -> Option<Layout> {
             _ => Param::Table { at: l.size },
         };
         let bytes = match p {
-            Param::Constants { count, .. } => 4 * count,
+            Param::Constants { count, .. } => count.checked_mul(4)?,
             Param::Table { .. } => 4,
             Param::Descriptor { .. } => 8,
         };
+        // the inline sums below are at most the size
+        let size = l.size.checked_add(bytes).filter(|&s| s <= MAX_ARGS)?;
         spilled |= l.inline + bytes > 4 * INLINE_SGPRS;
         if !spilled {
             l.inline += bytes;
@@ -120,7 +127,7 @@ pub fn layout_from_blob(blob: &[u8]) -> Option<Layout> {
         if !spilled_gfx {
             l.inline_gfx += bytes;
         }
-        l.size += bytes;
+        l.size = size;
         l.params.push(p);
     }
     Some(l)
@@ -130,6 +137,32 @@ pub fn layout_from_blob(blob: &[u8]) -> Option<Layout> {
 /// inline part are), from s4 the inline part of `args` (all arguments packed by `l`).
 pub fn user_data(l: &Layout, args: &[u8], table_at: u64) -> Vec<u32> {
     sgprs(FIRST_SGPR, l.inline, args, table_at)
+}
+
+/// Bytes of a compute dispatch's arguments that go in user SGPRs: the layout's rule, but
+/// never more than the shader itself has registers for. `user_sgprs` is the shader's own
+/// count (`real::pso_user_sgprs`; None = not known, the rule alone). The console's newer
+/// compiler follows the rule; XboxBvhBuilder.dll's shaders were built with four user SGPRs
+/// whatever their root signature (s4 is the group id) and take every argument from the
+/// table, also where the first ones would fit. Parameters stay whole: the inline part ends
+/// where the last parameter that fits the shader's registers ends.
+pub fn inline_for(l: &Layout, user_sgprs: Option<u32>) -> u32 {
+    let Some(user) = user_sgprs else { return l.inline };
+    let has = 4 * user.saturating_sub(FIRST_SGPR as u32);
+    if l.inline <= has {
+        return l.inline;
+    }
+    let end = |p: &Param| match *p {
+        Param::Constants { at, count } => at + 4 * count,
+        Param::Descriptor { at } => at + 8,
+        Param::Table { at } => at + 4,
+    };
+    l.params.iter().map(end).take_while(|&e| e <= has).last().unwrap_or(0)
+}
+
+/// `user_data` for a shader with `user_sgprs` user SGPRs (`inline_for`).
+pub fn user_data_for(l: &Layout, user_sgprs: Option<u32>, args: &[u8], table_at: u64) -> Vec<u32> {
+    sgprs(FIRST_SGPR, inline_for(l, user_sgprs), args, table_at)
 }
 
 /// `user_data` of a draw: the vertex and pixel shader's user SGPRs (inline from s8).
@@ -659,13 +692,17 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
     if uma_va == 0 {
         return Err("the UMA buffer is not open on the GPU".into());
     }
-    let _ = u;
+    // the whole recording is replayed into the PC list here: its transitions of textures kept
+    // in step are these
+    super::title_textures::list_reset(st.pc);
     let windows = super::real::uma_window_vas();
     let va = |p: usize| super::real::uma_va_of(p).unwrap_or(uma_va);
     let mut out = Translation::default();
     let mut layout: Option<Arc<Layout>> = None;
     let mut table: Vec<u8> = Vec::new();
     let mut pso: Option<*const ConsolePso> = None;
+    // heap windows (`pso::heap_windows`): a dispatch needs the shared heap even when the list set none
+    let mut heaps_set = false;
     let chunks: Vec<Vec<u32>> = st.chunks.iter().map(|(c, used)| c[..*used].chunks(4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect()).collect();
     'chunks: for words in &chunks {
         let mut at = 0usize;
@@ -691,6 +728,7 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
                     }
                 }
                 list.SetDescriptorHeaps(&heaps);
+                heaps_set = true;
                 at += 2 + 2 * n;
             } else if w0 == TRANSITIONS_MARKER {
                 let n = get(1) as usize;
@@ -700,6 +738,12 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
                     // borrowed (ManuallyDrop fields, nothing released)
                     let mut b: Vec<u64> = vec![0; 4 * n];
                     std::ptr::copy_nonoverlapping(words.as_ptr() as *const u8, b.as_mut_ptr() as *mut u8, 32 * n);
+                    if super::title_textures::any() {
+                        // each barrier: type | flags, resource, subresource | before, after
+                        let t: Vec<(usize, u32, D3D12_RESOURCE_STATES)> =
+                            b.chunks_exact(4).filter(|c| c[0] as u32 == 0).map(|c| (c[1] as usize, c[2] as u32, D3D12_RESOURCE_STATES(c[3] as u32 as i32))).collect();
+                        super::title_textures::note_transitions(st.pc, &t);
+                    }
                     list.ResourceBarrier(std::slice::from_raw_parts(b.as_ptr() as *const D3D12_RESOURCE_BARRIER, n));
                 }
                 out.barriers += n as u32;
@@ -779,13 +823,15 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
                             out.skipped_dispatches += 1;
                             continue;
                         }
-                        let inline = layout.as_ref().map_or(0, |l| l.inline as usize).min(table.len());
+                        let user_sgprs = super::real::pso_user_sgprs(real);
+                        let inline = layout.as_ref().map_or(0, |l| inline_for(l, user_sgprs) as usize).min(table.len());
                         let table_at = uma_copy(st, &table[inline..]).ok_or("UMA: argument table")?;
                         let mut io = match layout.as_ref() {
-                            Some(l) => user_data(l, &table, table_at as u64),
+                            Some(l) => user_data_for(l, user_sgprs, &table, table_at as u64),
                             None => vec![table_at as u32, (table_at >> 32) as u32],
                         };
                         io.resize(crate::gpu::recomp::KERNEL_SGPRS, 0);
+                        io[crate::gpu::recomp::IO_UMA_BASE_HI] = (u.base() >> 32) as u32;
                         let io_at = uma_copy(st, bytemuck_u32(&io)).ok_or("UMA: io")?;
                         let res_at = uma_copy(st, &[0u8; 256]).ok_or("UMA: res")?;
                         // the pipeline's own root signature when it has static samplers
@@ -793,6 +839,12 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
                         match own.as_ref().and_then(|r| ID3D12RootSignature::from_raw_borrowed(r)) {
                             Some(r) => list.SetComputeRootSignature(r),
                             None => list.SetComputeRootSignature(rs.as_ref().ok_or("no XCL ABI root signature")?),
+                        }
+                        if !heaps_set && crate::gpu::recomp::pso::heap_windows() {
+                            if let Some(g) = super::console_heap::global_heap() {
+                                list.SetDescriptorHeaps(&[Some(g)]);
+                                heaps_set = true;
+                            }
                         }
                         list.SetComputeRootUnorderedAccessView(0, va(io_at));
                         list.SetComputeRootUnorderedAccessView(1, va(res_at));
@@ -888,6 +940,25 @@ mod tests {
         assert_eq!(l.inline, 0, "19 constants do not fit in user SGPRs: everything in the table");
     }
 
+    /// The shader's own count of user SGPRs caps what goes inline: a shader built with four
+    /// (XboxBvhBuilder.dll's, whatever the root signature) takes every argument from the table.
+    #[test]
+    fn a_shader_with_four_user_sgprs_takes_every_argument_from_the_table() {
+        // two root descriptors and 16 constants: by the rule alone the descriptors are inline
+        let l = layout_from_blob(&rts0(&[(4, 0), (4, 0), (1, 16)])).unwrap();
+        assert_eq!((l.size, l.inline), (80, 16));
+        let args: Vec<u8> = (0..80u8).collect();
+        assert_eq!(inline_for(&l, None), 16, "count not known: the rule");
+        assert_eq!(inline_for(&l, Some(8)), 16, "four registers of arguments: the rule");
+        assert_eq!(inline_for(&l, Some(20)), 16, "more registers than the rule uses: the rule");
+        assert_eq!(inline_for(&l, Some(6)), 8, "two registers of arguments: one descriptor");
+        assert_eq!(inline_for(&l, Some(7)), 8, "three: still one descriptor, a parameter stays whole");
+        assert_eq!(inline_for(&l, Some(4)), 0, "s4 is not an argument: everything in the table");
+        assert_eq!(inline_for(&l, Some(0)), 0, "no user SGPR at all");
+        assert_eq!(user_data_for(&l, Some(4), &args, 0x7_0000_0100), vec![0x100, 7, 0, 0]);
+        assert_eq!(user_data_for(&l, Some(8), &args, 0x7_0000_0100), user_data(&l, &args, 0x7_0000_0100));
+    }
+
     /// RTS0 v2 of parameters (type: 0 table, 1 constants, 2–4 CBV / SRV / UAV; constant count)
     fn rts0(params: &[(u32, u32)]) -> Vec<u8> {
         let n = params.len() as u32;
@@ -900,6 +971,19 @@ mod tests {
             r.extend([0, 0, count]);
         }
         r.iter().flat_map(|w| w.to_le_bytes()).collect()
+    }
+
+    /// A blob whose constant count makes the arguments overflow u32 (0x4000_0000) or take
+    /// gigabytes (0x3FFF_FFFF: 0xFFFF_FFFC bytes, allocated at every Set*RootSignature) has no
+    /// layout; the largest one allowed still has one.
+    #[test]
+    fn a_huge_constant_count_has_no_layout() {
+        assert!(layout_from_blob(&rts0(&[(1, 0x4000_0000)])).is_none());
+        assert!(layout_from_blob(&rts0(&[(1, 0x3FFF_FFFF)])).is_none());
+        assert!(layout_from_blob(&rts0(&[(4, 0), (1, 0xFFFF_FFFF)])).is_none());
+        assert!(layout_from_blob(&rts0(&[(1, MAX_ARGS / 4), (0, 0)])).is_none());
+        let l = layout_from_blob(&rts0(&[(1, MAX_ARGS / 4 - 3), (4, 0), (0, 0)])).unwrap();
+        assert_eq!((l.size, l.inline), (MAX_ARGS, 0));
     }
 
     /// What the console's compiler does (its output on these root signatures): parameters in

@@ -1,12 +1,22 @@
-# Windows build and tests on every push and pull request.
-# GPU tests skip on the hosted runner (no D3D12 adapter) and the tests on console sample data
-# pass without running (their XCL_SAMPLE_* variables are not set) – see scripts/test.ps1.
+# Build + tests on a GitHub Windows runner: no GPU and no game data, so the GPU tests skip
+# (each prints "SKIPPED <test>: <reason>", counted at the end of scripts/test.ps1) and the
+# tests on game data pass without running. What it checks on every push and pull request:
+# the workspace builds, the unit / integration tests pass, and the recompiler's HLSL compiles
+# with the runner's DXC (Windows SDK).
+#
+# Left out: the test title's end-to-end run (`test_title_runs_and_game_folder_is_untouched`).
+# The runner has no System32\xgameruntime.dll (Gaming Services) and only the Microsoft Basic
+# Render Driver (4-lane waves): the launcher warns about both, which that test treats as a
+# failure. It still runs in `scripts/test.ps1` on a PC.
 name: CI
 
 on:
   push:
-    branches: ['**']
+    branches: [main]
   pull_request:
+
+permissions:
+  contents: read
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -14,60 +24,31 @@ concurrency:
 
 jobs:
   windows:
-    name: build and test (windows-msvc)
-    runs-on: windows-latest
-    timeout-minutes: 60
+    name: Build and test (Windows, no GPU)
+    runs-on: windows-2025
+    timeout-minutes: 45
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_INCREMENTAL: 0
     steps:
       - uses: actions/checkout@v4
 
-      - name: Rust toolchain
+      - name: Rust (stable, MSVC)
         run: |
-          rustup toolchain install stable --profile minimal --no-self-update
+          rustup toolchain install stable --profile minimal
           rustup default stable
-          rustc -Vv
-          cargo -V
+          rustc --version
 
-      - name: Cache cargo
-        uses: actions/cache@v4
+      - uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry/index
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             target
-          key: cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}-${{ hashFiles('**/Cargo.toml') }}
           restore-keys: cargo-${{ runner.os }}-
 
-      - name: Build (the e2e tests need the test title and DLL)
-        run: cargo build --workspace --locked
-
-      # The GPU tests run on WARP (wave32, no mesh shaders, no 4 GiB reserved resources): the ones
-      # that need wave64 skip themselves; the end-to-end ones below cannot and run apart.
-      - name: Test
+      - name: Build and test
         shell: pwsh
-        run: |
-          $skipped = @()
-          $gpu = 0
-          cargo test --workspace --no-fail-fast -- --test-threads=4 `
-              --skip test_title_runs_and_game_folder_is_untouched `
-              --skip console_wave64_compute_through_the_pso_hook_dispatch_and_read_back `
-              --skip async_compute_pso_registers_real_pso_and_not_standin 2>&1 | ForEach-Object {
-              $line = "$_"
-              if ($line -match '^SKIPPED \S+: (.+)$') { $skipped += $Matches[1] }
-              if ($line -match '^test \S*gpu\S* \.\.\. ok$') { $gpu += 1 }
-              Write-Host $line
-          }
-          $code = $LASTEXITCODE
-          Write-Host "GPU tests passed on this adapter: $gpu"
-          if ($skipped) {
-              $counts = $skipped | Group-Object | Sort-Object Count -Descending | ForEach-Object { "$($_.Count) ($($_.Name))" }
-              Write-Host "GPU tests skipped on this adapter: $($counts -join ', ')"
-          }
-          exit $code
-
-      # On WARP: the test title's frame faults inside d3d10warp.dll replaying its command list, and
-      # the compute PSO e2e tests need a wave64 adapter (first runs of this workflow, 2026-11-23).
-      # Reported, not blocking, until understood.
-      - name: End-to-end tests WARP cannot run (informational)
-        continue-on-error: true
-        run: cargo test -p xcl --no-fail-fast --test e2e --test gpu_compute_e2e
+        run: ./scripts/test.ps1 --skip test_title_runs_and_game_folder_is_untouched

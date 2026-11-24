@@ -100,6 +100,27 @@ pub(super) fn clear_state(list: *mut c_void, pso: usize) {
     });
 }
 
+/// Carry bound pipeline and root-signature / root-argument state from `from` to `to` across a
+/// deferred mid-list split (`to` records into `allocator` with its own fresh UMA arena while
+/// `from` retains its previously allocated blocks until `allocator` resets).
+pub(super) fn inherit_for_split(from: *mut c_void, to: *mut c_void, allocator: usize) {
+    let (layout, args, layout_gfx, args_gfx, rs_gfx, pso) = with(from, |s| {
+        (s.layout.clone(), s.args.clone(), s.layout_gfx.clone(), s.args_gfx.clone(), s.rs_gfx, s.pso)
+    });
+    let (old, blocks) = with(to, |s| {
+        let old = std::mem::replace(&mut s.allocator, allocator);
+        s.arena = Default::default();
+        s.layout = layout;
+        s.args = args;
+        s.layout_gfx = layout_gfx;
+        s.args_gfx = args_gfx;
+        s.rs_gfx = rs_gfx;
+        s.pso = pso;
+        (old, std::mem::take(&mut s.uma))
+    });
+    console_list::hold_until_reset(old, blocks);
+}
+
 /// The list is gone.
 pub(super) fn forget(list: *mut c_void) {
     if let Some(s) = STATES.lock().unwrap().as_mut().and_then(|m| m.remove(&(list as usize))) {
@@ -218,6 +239,24 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
     let (gfx, compute) = (super::real::is_translated_graphics(pso), super::real::is_translated_compute(pso));
     let (args_off, count_off) = (args_off + super::real::buffer_delta(args), count_off + super::real::buffer_delta(count_buf));
     if !gfx && !compute {
+        // A pipeline still being built (or whose build failed): its stand-in draws nothing, and
+        // the list may hold XCL's ABI root signature from a translated draw before it – the PC
+        // call with that pair is invalid (debug layer 953, "the currently set Root Signature
+        // doesn't match the currently set Pipeline State Object"; a retail title's world then
+        // hung the GPU, 0x887a0006). Skipped, like a draw or dispatch of such a pipeline.
+        if super::pso_async::is_pending(with(this, |s| s.pso)) {
+            count(DRAWS_SKIPPED);
+            static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            if N.fetch_add(1, Ordering::Relaxed) < 4 {
+                crate::xlog_warn!("D3D12.X: ExecuteIndirect with a pipeline that is still being built skipped");
+            }
+            return;
+        }
+        // a PC pipeline: the title's root signature, as for a draw (`graphics_bound`)
+        let rs = with(this, |s| s.rs_gfx) as *mut c_void;
+        if let (Some(list), Some(r)) = (ID3D12GraphicsCommandList::from_raw_borrowed(&this), ID3D12RootSignature::from_raw_borrowed(&rs)) {
+            list.SetGraphicsRootSignature(r);
+        }
         return pc(this, sig, max, args, args_off, count_buf, count_off);
     }
     if ROOT_SIGNATURES.lock().unwrap().as_ref().is_some_and(|s| s.contains(&sig)) {
@@ -254,6 +293,9 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
 /// is kept (a packed colour), any other is taken as a float. Vertices a shader makes from the
 /// vertex index alone (no vertex buffer) are not expanded.
 unsafe fn draw_rects(this: *mut c_void, list: &ID3D12GraphicsCommandList, vertices: u32, instances: u32, first_vertex: u32, first_instance: u32) -> bool {
+    if !cpu_rect_expansion(with(this, |s| s.pso)) {
+        return false;
+    }
     let Some(vbs) = super::list_x::rect_list_state(this) else { return false };
     let rects = (vertices / 3) as usize;
     if vbs.is_empty() || rects == 0 || rects > 4096 {
@@ -302,6 +344,13 @@ unsafe fn draw_rects(this: *mut c_void, list: &ID3D12GraphicsCommandList, vertic
     true
 }
 
+/// Whether a rect list drawn with the bound pipeline `pso` is expanded on the CPU (`draw_rects`):
+/// not with the rect list GS (`real::has_rect_list_gs`), which completes each rect itself – both
+/// would draw every rect twice (each CPU half is three corners of the rect).
+fn cpu_rect_expansion(pso: usize) -> bool {
+    !super::real::has_rect_list_gs(super::pso_async::resolve(pso))
+}
+
 /// #12 DrawInstanced
 pub(super) unsafe extern "system" fn draw_instanced(this: *mut c_void, vertices: u32, instances: u32, first_vertex: u32, first_instance: u32) {
     DRAW_ARGS.with(|d| d.set((false, vertices, instances, first_vertex, 0)));
@@ -309,7 +358,7 @@ pub(super) unsafe extern "system" fn draw_instanced(this: *mut c_void, vertices:
         if draw_rects(this, &list, vertices, instances, first_vertex, first_instance) {
             return;
         }
-        super::list_x::sync_title_buffers(this, None, first_vertex, vertices, instances);
+        super::list_x::sync_title_buffers(this, None, first_vertex, vertices, if first_instance != 0 { instances.max(2) } else { instances });
         list.DrawInstanced(vertices, instances, first_vertex, first_instance);
     }
 }
@@ -322,7 +371,7 @@ thread_local! {
 /// #13 DrawIndexedInstanced
 pub(super) unsafe extern "system" fn draw_indexed_instanced(this: *mut c_void, indices: u32, instances: u32, first_index: u32, base_vertex: i32, first_instance: u32) {
     if let Some(list) = prepare_indexed_draw(this, indices, instances, first_index, base_vertex) {
-        super::list_x::sync_title_buffers(this, Some((first_index, indices, base_vertex)), 0, 0, instances);
+        super::list_x::sync_title_buffers(this, Some((first_index, indices, base_vertex)), 0, 0, if first_instance != 0 { instances.max(2) } else { instances });
         emit_prepared_indexed_draw(&list, indices, instances, first_index, base_vertex, first_instance);
     }
 }
@@ -805,6 +854,7 @@ unsafe fn translated_dispatch(this: *mut c_void, list: &ID3D12GraphicsCommandLis
 /// arguments the console's way – compute or graphics) and the argument table in unified
 /// memory, u1 res, u2… the memory windows; then the pipeline.
 unsafe fn bind_abi(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usize, gfx: bool) -> Result<(), String> {
+    super::list_x::ensure_view_heap(this);
     let u = crate::gpu::uma::get().ok_or("no unified memory")?;
     let windows = super::real::uma_window_vas();
     let first = *windows.first().ok_or("unified memory is not open on the GPU")?;
@@ -815,19 +865,22 @@ unsafe fn bind_abi(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usi
         std::ptr::copy_nonoverlapping(bytes.as_ptr(), p, bytes.len());
         Ok(p as usize)
     };
-    let inline = layout.as_ref().map_or(0, |l| if gfx { l.inline_gfx } else { l.inline } as usize).min(args.len());
+    // a pipeline still being built in the background is waited for
+    let real = super::pso_async::resolve_wait(pso);
+    // a compute shader takes no more arguments from registers than it has (`inline_for`)
+    let user_sgprs = if gfx { None } else { super::real::pso_user_sgprs(real) };
+    let inline = layout.as_ref().map_or(0, |l| if gfx { l.inline_gfx } else { console_list::inline_for(l, user_sgprs) } as usize).min(args.len());
     let table_at = copy(&args[inline..])?;
     let mut io = match layout.as_ref() {
         Some(l) if gfx => console_list::user_data_gfx(l, &args, table_at as u64),
-        Some(l) => console_list::user_data(l, &args, table_at as u64),
+        Some(l) => console_list::user_data_for(l, user_sgprs, &args, table_at as u64),
         None => vec![table_at as u32, (table_at >> 32) as u32],
     };
     io.resize(crate::gpu::recomp::KERNEL_SGPRS, 0);
+    io[crate::gpu::recomp::IO_UMA_BASE_HI] = (u.base() >> 32) as u32;
     let io_at = copy(&io.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<u8>>())?;
     let res_at = copy(&[0u8; 256])?;
     let va = |p: usize| super::real::uma_va_of(p).unwrap_or(first);
-    // a pipeline still being built in the background is waited for
-    let real = super::pso_async::resolve_wait(pso);
     let rs = super::real::pso_root_signature(real).or_else(|| super::real::abi_rs_cached().map(|p| p as usize)).ok_or("no XCL ABI root signature")?;
     let rs = rs as *mut c_void;
     let rs = ID3D12RootSignature::from_raw_borrowed(&rs).ok_or("root signature")?;
@@ -874,6 +927,39 @@ mod tests {
     use super::super::{device_x, list_x, pso_async, real, title_list};
     use super::*;
     use std::sync::atomic::AtomicUsize;
+
+    /// A pipeline with the rect list GS draws its rect lists whole: draw_rects leaves them alone.
+    #[test]
+    fn rect_lists_with_the_rect_list_gs_are_not_expanded_on_the_cpu() {
+        let (with_gs, without) = (0x7E57_4000usize, 0x7E57_5000usize);
+        real::register_rect_list_gs_for_test(with_gs);
+        assert!(!cpu_rect_expansion(with_gs));
+        assert!(cpu_rect_expansion(without) && cpu_rect_expansion(0));
+        real::forget_pso_for_test(with_gs);
+        assert!(cpu_rect_expansion(with_gs));
+    }
+
+    /// An ExecuteIndirect whose bound pipeline is still being built is skipped (its stand-in
+    /// with XCL's ABI root signature on the list is the debug layer's 953 and a hung GPU);
+    /// a built or failed one goes to the PC call. The gate `execute_indirect` uses.
+    #[test]
+    fn execute_indirect_with_a_pipeline_still_building_is_skipped() {
+        let (building, built, failed) = (0x7E57_6001usize, 0x7E57_6002usize, 0x7E57_6003usize);
+        // lazy submits: no worker starts them, so the states stay under the test's control
+        pso_async::submit_lazy(building, false, Box::new(|| 0x1234), 0);
+        pso_async::submit_lazy(built, false, Box::new(|| 0x1235), 0);
+        pso_async::submit_lazy(failed, false, Box::new(|| 0), 0);
+        assert!(pso_async::is_pending(building));
+        assert_eq!(pso_async::resolve_wait(built), 0x1235);
+        assert_eq!(pso_async::resolve_wait(failed), failed);
+        assert!(!pso_async::is_pending(built) && !pso_async::is_pending(failed));
+        // never resolved: still pending (the skip case), then forgotten
+        assert!(pso_async::is_pending(building));
+        pso_async::released(building);
+        pso_async::released(built);
+        pso_async::released(failed);
+        assert!(!pso_async::is_pending(building));
+    }
 
     /// Minimal RTS0 v2 root signature blob with one 4-constant parameter.
     fn test_rts0_blob() -> Vec<u8> {

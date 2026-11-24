@@ -11,6 +11,7 @@ use crate::config::Config;
 use crate::util::glob_match;
 
 pub mod acphal;
+pub mod bcpack;
 pub mod d3d12_layout;
 pub mod d3d12x;
 pub mod dstorage;
@@ -111,6 +112,8 @@ fn build(config: &Config) -> Registry {
     ];
     let offline = netoff::enabled();
     if offline {
+        // the system's own network functions too, for whatever reaches them (#305)
+        netoff::install_system_hooks();
         let mut m = HleModule::new(netoff::NETOFF, netoff::exports(), &[SELF]);
         m.ordinals = netoff::ordinals().into_iter().collect();
         modules.push(m);
