@@ -36,73 +36,29 @@ Tu reprends le projet XCL (fork `gbuyssens/xcl` de `ivall/xcl`). Lis d'abord `RE
   Lake i5/i7 sans CLWB/CLZERO, RTX 3060 12 Go, 32 Go RAM, pagefile 48 Go), colle le log, tu
   analyses, corriges, commits, pousses.
 
-## État du dépôt
+## État du dépôt (2026-11-24)
 
-- `main` = `origin/main` = `56d9633` (« A memory line at every crash… ») sur `7026d61`
-  (« XGTextureAddressComputer #10 is GetResourceTiling… ») sur `4c5207d` (commit de l'utilisateur).
-- Upstream `ivall/xcl` main = `956a476` (« Retail game reaches 30 fps ») au 2026-11-23.
-- Branches PR locales **et** poussées, toutes rebasées sur `956a476`, toutes cross-checkées :
-  `pr/trace-tooling` (9392eae), `pr/console-insn` (0b28a39), `pr/xg-resource-tiling` (50cff5d),
-  `pr/memory-report` (9e79c69), `pr/f16-directed-rounding` (49ee291, = PR #128 ouverte).
-- PR déjà fusionnées upstream : #127, #129. Fermées comme doublons : #126, #130.
-- Branches **obsolètes, ne pas ouvrir** : pr/newer-title-startup (dans 9add721 upstream),
-  pr/omod-clamp, pr/vram-arenas-queue18, pr/frame-clock, pr/eh-pe-cpu-check, le commit chad.dll
-  XDsp (66e8e97 d'ivall).
+- **L'upstream est `xcl-dev/xcl`** (`ivall/xcl` y redirige) : 7 300 étoiles, 811 PR ouvertes, 314 commits en un
+  jour. Se mettre à jour : `git fetch https://github.com/xcl-dev/xcl main` puis fusionner dans `main` du fork.
+- `main` du fork = fusion de l'upstream 9e3831e (db638f3) + les diagnostics du fork (notes de device removal,
+  traçage des stubs par préfixe, `code bytes` sur chaque ligne de crash) + `HANDOFF.md` à jour (section
+  « Upstream moved to xcl-dev… » : faits tirés de VIctory et AnyXboxX, deux projets GPL-3 sur le même titre –
+  faits seulement, jamais de code : XCL est GPL-2).
+- PR : voir `PRS.md`. #128 (f16) mise à jour et poussée (2bc03fa), attend ton run GPU et ton commentaire.
+  #194 à fermer (remplacée par `XCL_ACTIVITY`). Le reste est fusionné ou obsolète.
+- Branches locales `pr/*` autres que `pr/f16-directed-rounding` : obsolètes, ne rien en ouvrir.
 
-## Ce qui a été fait dans la dernière session (ne pas refaire)
+## Ce que l'utilisateur doit faire
+1. `git pull`, `cargo build --release`, et **lancer en mode Series S** : `device_type = "lockhart"` dans la
+   config (le titre budgète sa mémoire d'après le type de console : 8 Go au lieu de 13,5 ; AnyXboxX mesure
+   +50 % de fps en 720p interne). Toujours `XCL_NETWORK=0`. Coller le log : dernière ligne `XCL_ACTIVITY`
+   avant un crash, la ligne de crash avec `code bytes`, ce que la fenêtre montre.
+2. Tests GPU sur `pr/f16-directed-rounding`, puis le commentaire de `PRS.md` sur #128 ; fermer #194.
 
-- `crates/xcl/src/memstat.rs` : ligne `memory:` (commit process / working set, commit système et
-  pagefile, RAM libre et charge, vidéo LOCAL / NON_LOCAL via `IDXGIAdapter3::QueryVideoMemoryInfo`
-  sur le LUID du device, compteurs bruts de ce que le titre a demandé par genre GRAPHICS /
-  WINDOWS / HEAP / PHYSICAL, tuiles et pools des fenêtres sparse). Loguée à chaque crash
-  (`eh.rs`, filtre non géré et `hk_nt_terminate_process`) et par un thread `xcl-memstat` dès que
-  le commit grossit d'un GiB (au plus toutes les 30 s). Démarrée dans `host.rs` après
-  `eh::start_probes()`.
-- `eh.rs` : chaque ligne de crash porte `(code bytes: …)`.
-- `hle/xg.rs` : le slot 10 de `XGTextureAddressComputer` est **GetResourceTiling** (lu dans le
-  code de `xg_xs.dll`, vtable 0x180050b68 ; six arguments comme
-  `ID3D12Device::GetResourceTiling` ; E_FAIL hors swizzle 64 KiB modes 8–11 / 16–19 / 24–27 ;
-  E_NOTIMPL pour 1D/3D ; forme de tuile par bpe 1→256×256, 2→256×128, 4→128×128, 8→128×64,
-  16→64×64 ; structs de 12 octets). Test `resource_tiling_of_a_64kb_texture`. La devinette
-  GetSubresourceLayout du commit b1580a8 (issue de ivall/xcl#169) est retirée. Slot 11 =
-  GetDescriptor(plane<3, T# de 32 octets), slot 12 = bit 27 du dword à this+0x2818 : **pas
-  modélisés**, à faire seulement si un log les réclame.
-- `hle/kernelx.rs` : `crate::memstat::note(kind, bytes)` sur tous les chemins de commit.
-- `hle/d3d12x/sparse.rs` : `pub fn stats() -> Option<(usize, usize)>`.
-- Outils RE dans l'ancien scratchpad (perdus avec la session) : `xgtools/pe.py` (objdump mingw,
-  `python3 -I`). `xg_xs.dll` est un upload de l'utilisateur, **ne jamais le committer**.
-
-## Diagnostic en cours : le mur mémoire
-
-[Certain] Dernier crash : commit process ≈ 75 Go (RAM 84 %, pagefile 48 Go à 98 %), allocation
-NULL puis écriture à 0 dans le démarrage d'un thread ; PSO en E_OUTOFMEMORY (0x8007000e).
-Sur une carte 12 Go, les pools de tuiles au-delà de la VRAM basculent en mémoire non-locale
-(système partagée), ce qui double le commit par GiB.
-
-[Likely] La majorité des 75 Go est ce débordement non-local du pilote → la réparation est de
-**plafonner les pools de tuiles résidents** dans `sparse.rs` (évincer / recycler des pools de
-1024 tuiles au lieu d'en créer sans fin).
-Alternative : si la ligne `memory:` montre « the title asked for graphics » > 40 Go à lui seul,
-c'est un bug de libération dans les fenêtres sparse (tuiles jamais démappées), pas le pilote.
-**Ne tranche pas sans la ligne.**
-
-## Ce que l'utilisateur doit faire (et ce que tu attends de lui)
-
-1. `git pull`, `cargo build --release`, lancer avec `XCL_NETWORK=0`, coller : la **dernière ligne
-   `memory:` avant le crash**, la ligne de crash avec `code bytes`, confirmer que
-   `XGTextureAddressComputer::#10` a quitté la liste des stubs, et ce que la fenêtre affiche.
-2. Envoyer maintenant les PR `pr/trace-tooling`, `pr/console-insn`, `pr/xg-resource-tiling`
-   (préciser qu'elle remplace la partie xg de #169 ; le remap DSV est couvert par #163/#170).
-   Liens compare et textes complets dans `PRS.md`.
-3. Après le run : envoyer `pr/memory-report` (remplir « Tested: » avec le GPU) et poster le
-   commentaire préparé sur #128 après `scripts\test.ps1`.
-
-## Après la ligne `memory:`
-
-- Pilote non-local → cap des pools résidents dans `sparse.rs`, commit sur `main`, branche
-  `pr/sparse-pool-cap` rebasée sur upstream, texte dans `PRS.md`.
-- Fuite sparse → trouver le chemin de démappage manquant (release de fenêtres / `XMemFree` sur
-  commit_sparse), même procédure.
-- Ensuite : stubs restants (#31 queue depuis caller 0x0, #139, #9, #131, #132, #35, #126, #142,
-  #75), adresses fantaisistes de `Write64BitValueBottomOfPipeX`, `Close → 0x80004005`, rejets de
-  PSO / « console shaders in the PSO without a translation » (domaine d'ivall).
+## Ensuite
+- L'upstream atteint les réglages après le premier menu avec ~15 Go de commit ; VIctory charge le monde (50 s)
+  mais l'image y reste noire ; AnyXboxX y a un personnage contrôlable à 2,4 fps. Les leçons transférables sont
+  dans HANDOFF.md ; XCL a déjà le plafond de descripteurs (OPTIONS19), la garde de boucle (`xcl_budget` 2^16),
+  `XMemGetWorkingSetStatistics` par type de console, le mode Lockhart. Manque : un garde-fou GPU des
+  enregistrements d'`ExecuteIndirect` (VIctory borne sommets / instances / groupes par une passe HLSL), et un
+  traçage des compteurs d'arguments par passe quand une scène reste noire.
