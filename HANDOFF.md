@@ -1881,6 +1881,89 @@ three `graphics PSO rejected (0x8007000e)` just before are the driver's E_OUTOFM
   size at every submit; a page guard (read-only until the first CPU write, `kernelx::lazy`) was tried and reverted
   pending measurement past the menus.
 
+## Upstream moved to xcl-dev, and what two sibling projects know (2026-11-24)
+
+- **Upstream is `xcl-dev/xcl` now** (`ivall/xcl` shows that page; `git fetch https://github.com/xcl-dev/xcl main`).
+  It took 314 commits in one day (PR numbers past #1350, 7 300 stars): memory windows from the descriptor heap with no
+  per-access `switch`, reserved resources known from their creation, same-window copies through scratch buffers,
+  Wait64 bridged to GPU fences, the driver's pipeline blobs kept on disk and an earlier run's pipelines built ahead,
+  BCPack unpacking, PR check scripts (`scripts/pr_check`: a smoke block with title, time and frames is required).
+  This fork merged it (db638f3) after merging 2abc562; where the fork and upstream had implemented the same thing
+  (lazy pipelines, the PC's view formats, XG #10, free pool release, the debug layer's cap, a memory line – upstream's
+  `XCL_ACTIVITY`) upstream's version is kept. Of the fork's PR branches `pr/console-insn` (#160) and
+  `pr/trace-tooling` are merged; `pr/xg-resource-tiling` and `pr/memory-report` are superseded, do not open them.
+- **Two public GPL-3 projects target the same retail title** (XCL is GPL-2: facts only, nothing copied):
+  Marvisak/VIctory (Rust, same architecture; boot, menus at 30 fps, intro video with sound, saves, a ~50 s load
+  into the world, where the scene stays dark at 0.5–1.8 s per frame; a run on a real GPU can hang it) and
+  LooperSalty/AnyXboxX (its fork of VIctory plus 24 community PRs; the world with a controllable character at
+  2.4 fps, image black). Facts worth having, from AnyXboxX's notes (`docs/running-gta6.md`, `docs/research/*`):
+  - **Series S mode**: the title in Lockhart mode renders at 1280x720 (presented at 1080p) and runs ~50 % faster
+    (3.2 vs 2.4 fps there); the console's title memory is 8 GiB instead of 13.5. XCL has it already:
+    `device_type = "lockhart"` in the config (`config.rs`, `console_mode()` answers 0x60 in the OEM registry key,
+    `XSystemGetDeviceType` 6). **Run the retail title in Lockhart mode on a 32 GB / 12 GB machine** before anything
+    else: the title budgets its own memory from the device type.
+  - **HRESULT trap**: a helper in the title ends in `int3` when a call returns 0x887A0005 / 06 / 07 / 20 (device
+    removed / hung / reset / invalid call) – 53 call sites. A device removal is fatal for the title whatever XCL does
+    after it; never hand those codes back for anything else.
+  - What the title asks for at start: a third `XMemVirtualAlloc` of 0x49400000 bytes (1.14 GiB, attributes
+    0x20003000, type 0x183, protection 0x22004 – a NULL for attribute word 0x20402000 ends in `int3`);
+    `XMemAllocatePhysicalPages(0x280, …)` 11 360 pages of 64 KiB (710 MiB); a `XMemMapPhysicalPagesScatter` of 0x1a40
+    pages (420 MiB); `D3D12ConfigureVirtualMemoryX` only needs S_OK; DirectStorage `SetStagingBufferSize` 32 MiB.
+    Physical pages mapped twice must alias (their first xmem committed a copy per mapping and doubled the commit).
+  - Their per-frame costs in the world (~410 ms): GPU ~145 ms, copy-back of GPU writes to the title ~73 ms
+    (`NtWriteVirtualMemory` directly: 1.5 s → 0.13 s a frame), hashing 20–60 ms, snapshot ~50 ms; watching title
+    memory 413 → 224 ms after deduplicating overlapping watch ranges. DRED on costs ~2.5x (VirtualQuery per draw).
+    A translated-loop iteration cap (32) took GPU time from 1.1 s to 0.2 s a frame: their translated loops ran
+    nearly endless. NVIDIA caps a descriptor heap at 1 000 000 entries; with a 65 536-slot dynamic range ~720
+    indirect mesh dispatches a frame were dropped.
+  - **Their black image**: the G-buffer has the geometry; the final colour is a uniform tint that darkens over time
+    (exposure adapting). ~379 mesh `ExecuteIndirect` calls a frame start with zero arguments because the compute
+    passes producing the arguments are untranslated in their recompiler ("a lane mask read as data", "lanes held
+    elsewhere", "an address from a phi", unknown structured-buffer stride, scalar loads read as data). XCL's
+    recompiler does not refuse programs (unsupported instructions become comments, `Translation::unsupported_why`),
+    so the lesson is the diagnostic, not the fix: **trace `ExecuteIndirect` argument counts per pass** when a scene
+    stays dark, and know which pass wrote them.
+  - Their GPU hangs were on `DispatchMesh`; the debug layer counted barriers with a wrong "before" state (117) and
+    vertex buffers left in UAV state (74); a 256-iteration polling loop in the title's BVH builder; `VICTORY_RT_MISS`
+    (every ray misses) and skipping the BVH builder bisect it. Diagnostics worth copying as ideas: show the busiest
+    render target, a "producers" check (a pass reading what only dropped work writes), per-list GPU timing, a
+    sampling profiler of the whole process every 5 s, skip a pipeline by hash, scripted key presses.
+  - **VIctory's memory model** (`crates/victory-gpu`, `victory-hle/modules/xmem.rs`): title GPU memory is plain host
+    memory, GPU address = CPU address, no tiled resources, nothing of the title's in VRAM directly. Physical pages are
+    one pagefile-backed `CreateFileMappingW(SEC_RESERVE)` section per `XMemAllocatePhysicalPages` call (the title asks
+    6.1 GiB at once; a full host fails SEC_COMMIT with 1450), mapped with `MapViewOfFile3(MEM_REPLACE_PLACEHOLDER)`
+    into placeholders and committed per mapped view – so two mappings of a page alias and commit is charged once;
+    `CopyPageMappingsBatchX` is done on the CPU by aliasing section slices. Buffers get a host copy on first draw in a
+    CUSTOM write-back L0 heap (system RAM, UAV allowed, 64 KiB rounding), refreshed per submission from write-watch
+    (`GetWriteWatch` + a journal; physical-page views, which cannot be watched, are `PAGE_READONLY` per 64 KiB block
+    with a vectored handler taking the first write); GPU writes are snapshotted before and written back byte-wise
+    after (writing the whole copy back clobbered CPU writes made meanwhile and crashed the title). Textures are the
+    only VRAM: a DEFAULT committed host texture per resource, detiled into a per-texture UPLOAD staging buffer on
+    first sample, change found by write-watch or a blake3 hash per submission. Every submission is waited on (no
+    CPU/GPU overlap). No budget or eviction at all; the title still needs "several GiB of commit" (error 1455).
+    `XMemGetWorkingSetStatistics` there: 10 GiB GPU-optimal + 3.5 GiB standard on Series X, 7 776 MiB on Series S
+    (XCL: `title_memory_budget_mb`, 13 824 / 8 192).
+  - **VIctory's D3D12.X facts**: the title creates ~60 000 pipelines in 20 s and draws with a few dozen (host PSOs at
+    first draw, 2–8 workers, at most 500 ms of waiting per title frame, a draw whose pipeline is not ready is dropped;
+    a disk `ID3D12PipelineLibrary` keyed by DXIL + root signature + state, last run's pipelines pre-built during the
+    next load: first world frame 3.2 s cold / 0.37 s warm). Its ExecuteIndirect signatures have one argument each
+    (draw stride 16, indexed 20, dispatch 12, mesh 12, console type 105 run as a dispatch); records are clamped on
+    the GPU by an HLSL pass first (2^24 vertices, 2^26 instances, 65 535 groups a dimension, 2^20 a dispatch, a
+    thread budget of 2^27 per list) – a hang guard XCL lacks. Its descriptor heap has 1 245 184 slots (XCL caps at
+    OPTIONS19's MaxViewDescriptorHeapSize, 1 000 000 on NVIDIA – check the title's heap fits). Translated loops stop
+    after 2^20 iterations a lane (XCL: `xcl_budget` 2^16). Frame clock: an absolute 16 667 µs tick from device #0x270,
+    the origin wait hands out consecutive tokens, also on timeout with flag 2; GetFrameStatisticsX count 0; PresentX
+    into a 2-buffer FLIP_DISCARD swap chain. Loading: DirectStorage queues weighted ~10x per priority level, the
+    compressed bytes in flight capped at the staging size (32 MiB), zlib then BCPack (their own rANS, 12 / 16 lanes,
+    128 models; BC1 30–60 MB/s, BC7 15–20 MB/s); writes into title memory bound loading (3.5 → 7.8 GiB/s on 8
+    threads by writing one view per run). GTA-class title audio there: XMA2 contexts only, decoded on a thread.
+  - System surface the title needs, from their static analysis: 587 named imports from 68 DLLs in the exe (xmem 12,
+    d3d12_xs 3, xg_xs 2, XCRDAPI 1, chad 5, xapu 5, AcpHal 9), one export `__XMemAllocationHooks__`; `XErrorReport`
+    looked up by GetProcAddress six times; TLS callback 1 with reason 2 for every thread (a 5 248-byte block);
+    `XGCreateTextureComputer` slot 8 called once per mip with every output pointer written; `DStorageGetFactory`'s
+    factory slot 8 (+0x40) must return S_OK; queue flags 0x2 / 0x3 are masked to 0x1; `PresentX` needs the frame
+    token of `WaitFrameEventX`; the title reads input at 30 Hz; saves have a 256 MiB quota per configuration.
+
 ## Next steps (priority)
 Little is left to do without the exe – the rest needs an actual run of the game.
 1. Once the user has a legal game exe: `xcl inspect`, `xcl run`, analysis of `report.json`
